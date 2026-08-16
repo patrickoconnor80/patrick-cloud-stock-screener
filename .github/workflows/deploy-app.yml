@@ -55,5 +55,6 @@ jobs:
 
       - name: Invoke once so the site refreshes immediately
         run: |
-          aws lambda invoke --function-name "$FUNCTION_NAME" /tmp/invoke-output.json
+          # Full screen run can take several minutes; the default CLI read timeout is too short.
+          aws lambda invoke --cli-read-timeout 900 --function-name "$FUNCTION_NAME" /tmp/invoke-output.json
           cat /tmp/invoke-output.json
