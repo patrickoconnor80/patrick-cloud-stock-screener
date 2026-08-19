@@ -1,12 +1,14 @@
 # Stock Screener
 
 Daily stock screener (200-day SMA + 8-day EMA + market cap, ranked by EPS)
-running on AWS Lambda, triggered by EventBridge, results published to
+running on AWS Lambda, triggered by EventBridge weekdays at 4:01pm ET (right
+after market close), results published to
 [patrick-cloud.com/stock-screener/results.json](https://patrick-cloud.com/stock-screener/results.json)
-and rendered on the [website](https://patrick-cloud.com/stock-screener.html).
+and rendered in the Daily Screener section of the
+[Stocks page](https://patrick-cloud.com/stocks.html).
 
-See [stock-screener/README.md](../stock-screener/README.md) for the screener
-logic itself and local (non-Lambda) usage.
+Top 15 by trailing EPS. Each row also carries forward P/E and sector/industry
+(both from yfinance) alongside price, market cap, and trailing EPS.
 
 ## Layout
 

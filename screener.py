@@ -11,7 +11,9 @@ Filters:
   - Last close > 200-day SMA
   - Last close > 8-day EMA
   - Market cap > $1B
-Output: top N by EPS (trailing twelve months), descending.
+Output: top N by EPS (trailing twelve months), descending. Each row also
+carries forward P/E and sector/industry (from yfinance) alongside price,
+market cap, and trailing EPS.
 
 Requires: pandas, requests, yfinance, lxml
     pip install pandas requests yfinance lxml
@@ -158,6 +160,9 @@ def fetch_fundamentals(ticker: str) -> dict | None:
                 "name": info.get("shortName"),
                 "market_cap": market_cap,
                 "eps": eps,
+                "forward_pe": info.get("forwardPE"),
+                "sector": info.get("sector"),
+                "industry": info.get("industry"),
                 "price": info.get("currentPrice") or info.get("regularMarketPrice"),
             }
         except Exception:
@@ -182,7 +187,7 @@ def fundamental_filter(tickers: list[str], min_marketcap: float, max_workers: in
 
 def main():
     parser = argparse.ArgumentParser(description="Daily stock screener: 200 SMA + 8 EMA + market cap, ranked by EPS.")
-    parser.add_argument("--top", type=int, default=5, help="number of results to return (default: 5)")
+    parser.add_argument("--top", type=int, default=15, help="number of results to return (default: 15)")
     parser.add_argument("--min-marketcap", type=float, default=1e9, help="minimum market cap in dollars (default: 1e9)")
     parser.add_argument("--sma-period", type=int, default=200, help="SMA lookback period (default: 200)")
     parser.add_argument("--ema-period", type=int, default=8, help="EMA lookback period (default: 8)")
@@ -224,6 +229,7 @@ def main():
     print(top.to_string(index=False, formatters={
         "market_cap": lambda x: f"${x:,.0f}",
         "eps": lambda x: f"{x:.2f}",
+        "forward_pe": lambda x: f"{x:.2f}" if pd.notna(x) else "n/a",
         "price": lambda x: f"${x:,.2f}" if pd.notna(x) else "n/a",
     }))
 

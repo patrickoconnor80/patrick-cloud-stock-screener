@@ -69,7 +69,7 @@ resource "aws_lambda_function" "stock_screener" {
       RESULTS_BUCKET             = var.website_bucket
       RESULTS_KEY                = var.results_key
       CLOUDFRONT_DISTRIBUTION_ID = var.cloudfront_distribution_id
-      TOP_N                      = "5"
+      TOP_N                      = "15"
       MIN_MARKETCAP              = "1e9"
     }
   }

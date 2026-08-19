@@ -9,7 +9,7 @@ Environment variables (set by Terraform, see tf/lambda.tf):
   RESULTS_BUCKET              S3 bucket to write results.json to
   RESULTS_KEY                 S3 key, e.g. stock-screener/results.json
   CLOUDFRONT_DISTRIBUTION_ID  distribution to invalidate after writing
-  TOP_N                       number of results to keep (default 5)
+  TOP_N                       number of results to keep (default 15)
   MIN_MARKETCAP               minimum market cap filter (default 1e9)
 """
 
@@ -25,7 +25,7 @@ import screener
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 RESULTS_KEY = os.environ.get("RESULTS_KEY", "stock-screener/results.json")
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
-TOP_N = int(os.environ.get("TOP_N", "5"))
+TOP_N = int(os.environ.get("TOP_N", "15"))
 MIN_MARKETCAP = float(os.environ.get("MIN_MARKETCAP", "1e9"))
 
 
