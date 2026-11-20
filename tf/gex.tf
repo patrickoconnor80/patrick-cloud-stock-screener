@@ -60,18 +60,7 @@ resource "aws_sns_topic" "gex_alerts" {
   tags = local.tags
 }
 
-resource "aws_iam_role_policy" "gex_publish_alerts" {
-  name = "${local.prefix}-gex-publish-alerts"
-  role = aws_iam_role.stock_screener_lambda.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "sns:Publish"
-      Resource = aws_sns_topic.gex_alerts.arn
-    }]
-  })
-}
+# sns:Publish for the Lambda lives in the shared managed policy in lambda.tf.
 
 output "gex_alert_topic_arn" {
   value = aws_sns_topic.gex_alerts.arn

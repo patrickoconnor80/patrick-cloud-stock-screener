@@ -43,6 +43,13 @@ data "aws_iam_policy_document" "stock_screener_lambda" {
   }
 
   statement {
+    sid       = "PublishGexAlerts"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.gex_alerts.arn]
+  }
+
+  statement {
     sid    = "InvalidateCache"
     effect = "Allow"
     actions = [
