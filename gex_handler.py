@@ -17,11 +17,15 @@ Environment variables (set by Terraform):
   GEX_KEY                     S3 key, e.g. stock-screener/gex.json
   CLOUDFRONT_DISTRIBUTION_ID  distribution to invalidate after writing
   ALERT_TOPIC_ARN             SNS topic for email alerts (optional)
+  SES_FROM                    verified SES sender; when set, alerts go out as HTML
+                              (with the strike x expiration heatmap) to the topic's
+                              confirmed email subscribers, falling back to SNS text
 
 Invoke with {"force": true} to run outside market hours, and
 {"test_alert": true} to send a test email.
 """
 
+import html
 import json
 import os
 import time as _time
@@ -36,6 +40,7 @@ GEX_KEY = os.environ.get("GEX_KEY", "stock-screener/gex.json")
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
 ALERT_TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
 TRADIER_TOKEN_PARAM = os.environ.get("TRADIER_TOKEN_PARAM")   # SSM SecureString name
+SES_FROM = os.environ.get("SES_FROM")
 SITE = "https://patrick-cloud.com/data.html"
 
 
@@ -57,10 +62,93 @@ def money(n):
     return ("-$" if n < 0 else "+$") + s
 
 
-def send(subject, body):
+def _cell(v, vmax):
+    """Teal for positive gamma, magenta for negative, brighter with size."""
+    if not v:
+        return "#16161d", "#6b7280"
+    a = min(abs(v) / vmax, 1) if vmax else 0
+    lo, hi = ((15, 60, 58), (20, 184, 166)) if v > 0 else ((60, 20, 52), (217, 70, 239))
+    r, g, b = (round(l + (h - l) * a ** 0.6) for l, h in zip(lo, hi))
+    return f"rgb({r},{g},{b})", ("#0b0b10" if a > 0.55 else "#f3f4f6")
+
+
+def _short(v):
+    a = abs(v)
+    s = f"{a / 1e9:.1f}B" if a >= 1e9 else f"{a / 1e6:.0f}M" if a >= 1e6 else f"{a / 1e3:.0f}K"
+    return ("+" if v > 0 else "-") + s
+
+
+def heatmap_html(t, rows=21):
+    """Strike x expiration grid around spot as an inline-styled table (email clients
+    drop <style> blocks). Largest absolute cell is yellow, like most GEX apps."""
+    g = t.get("grid") or {}
+    strikes, exps, vals = g.get("strikes") or [], g.get("expiries") or [], g.get("values") or []
+    if not strikes or not exps:
+        return ""
+    spot, flip = t["spot"], t.get("flip")
+    mid = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+    lo = max(0, min(mid - rows // 2, len(strikes) - rows))
+    idx = range(lo, min(len(strikes), lo + rows))
+    cells = [v for i in idx for v in vals[i]]
+    vmax = max((abs(v) for v in cells), default=0)
+    td = "padding:4px 5px;text-align:right;font:11px Menlo,Consolas,monospace;white-space:nowrap;"
+    head = "".join(f'<th style="{td}color:#9ca3af;font-weight:600;">{e[5:].replace("-", "/")}</th>' for e in exps)
+    body = []
+    for i in idx:
+        k = strikes[i]
+        is_spot = i == mid
+        flip_here = flip is not None and i + 1 < len(strikes) and strikes[i + 1] < flip <= k
+        lab = f"{k:g}" + (" &#9664;" if is_spot else "")
+        row = [f'<td style="{td}color:{"#fbbf24" if is_spot else "#e5e7eb"};font-weight:{700 if is_spot else 400};">{lab}</td>']
+        for v in vals[i]:
+            bg, fg = ("#facc15", "#111") if vmax and abs(v) == vmax else _cell(v, vmax)
+            row.append(f'<td style="{td}background:{bg};color:{fg};">{_short(v) if v else ""}</td>')
+        border = "border-bottom:2px dashed #f59e0b;" if flip_here else ""
+        body.append(f'<tr style="{border}">' + "".join(row) + "</tr>")
+    regime = t.get("regime", "?")
+    cap = (f"{t['ticker']} ${spot:,.2f} &middot; dealers net {html.escape(regime)} gamma"
+           + (f" &middot; flip {flip:g} (dashed line)" if flip else "")
+           + " &middot; &#9664; = spot &middot; $ gamma per 1% move")
+    return (f'<div style="margin:18px 0 6px;font:600 14px -apple-system,Segoe UI,Arial;color:#111;">{t["ticker"]} gamma heatmap</div>'
+            f'<div style="overflow-x:auto;"><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#0b0b10;border-radius:6px;">'
+            f'<tr><th style="{td}color:#9ca3af;">Strike</th>{head}</tr>{"".join(body)}</table></div>'
+            f'<div style="font:11px -apple-system,Segoe UI,Arial;color:#6b7280;margin-top:4px;max-width:420px;">{cap}</div>')
+
+
+def email_recipients():
+    """Confirmed email subscribers of the alert topic, so the address list lives in
+    one place (the SNS subscription) and never in code or Terraform."""
+    out, kw = [], {"TopicArn": ALERT_TOPIC_ARN}
+    sns = boto3.client("sns")
+    while True:
+        r = sns.list_subscriptions_by_topic(**kw)
+        out += [s["Endpoint"] for s in r["Subscriptions"]
+                if s["Protocol"] == "email" and s["SubscriptionArn"].startswith("arn:")]
+        if not r.get("NextToken"):
+            return out
+        kw["NextToken"] = r["NextToken"]
+
+
+def send(subject, body, tickers=()):
     print(f"ALERT: {subject}")
-    if ALERT_TOPIC_ARN:
-        boto3.client("sns").publish(TopicArn=ALERT_TOPIC_ARN, Subject=subject[:99], Message=body)
+    if not ALERT_TOPIC_ARN:
+        return
+    if SES_FROM:
+        try:
+            to = email_recipients()
+            if to:
+                text = html.escape(body).replace(html.escape(SITE), f'<a href="{SITE}">{SITE}</a>')
+                page = ('<div style="max-width:640px;font:14px/1.5 -apple-system,Segoe UI,Arial;color:#111;">'
+                        f'<div style="white-space:pre-wrap;">{text}</div>'
+                        + "".join(heatmap_html(t) for t in tickers) + "</div>")
+                boto3.client("ses").send_email(
+                    Source=SES_FROM, Destination={"ToAddresses": to},
+                    Message={"Subject": {"Data": subject[:200]},
+                             "Body": {"Text": {"Data": body}, "Html": {"Data": page}}})
+                return
+        except Exception as ex:   # fall back to the plain-text SNS email
+            print(f"SES send failed ({type(ex).__name__}: {ex}); using SNS")
+    boto3.client("sns").publish(TopicArn=ALERT_TOPIC_ARN, Subject=subject[:99], Message=body)
 
 
 def previous_snapshot(s3):
@@ -91,6 +179,7 @@ def pin_alerts(payload, prev):
             f"Pin structures centered on {pin['node']:g}: long call butterfly (debit) or short iron butterfly (credit).\n"
             f"Not a short plain butterfly: that profits from movement away from the strike.\n\n"
             f"Live map: {SITE}\n\nModel estimate from delayed Yahoo option chains; dealer positions are assumed, not observed.",
+            tickers=[t],
         )
 
 
@@ -122,6 +211,7 @@ def event_alerts(payload, now):
             f"IV-crush structures (short iron butterfly / iron condor) collect this premium and win if the actual move is "
             f"smaller than implied. In short gamma, a worse-than-priced print runs: keep defined-risk wings.\n\n"
             f"Calendar and live map: {SITE}",
+            tickers=[t for t in payload["tickers"] if not t.get("error")],
         )
 
 

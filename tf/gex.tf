@@ -21,6 +21,7 @@ resource "aws_lambda_function" "gex" {
       GEX_KEY                    = var.gex_key
       CLOUDFRONT_DISTRIBUTION_ID = var.cloudfront_distribution_id
       ALERT_TOPIC_ARN            = aws_sns_topic.gex_alerts.arn
+      SES_FROM                   = "GEX Alerts <alerts@${var.ses_domain}>"
       # SecureString created by hand (not in Terraform, so the token stays out of
       # state). Absent = the Lambda uses Yahoo SPY/QQQ instead of Tradier SPX/NDX.
       TRADIER_TOKEN_PARAM = local.tradier_token_param
@@ -67,4 +68,38 @@ resource "aws_sns_topic" "gex_alerts" {
 
 output "gex_alert_topic_arn" {
   value = aws_sns_topic.gex_alerts.arn
+}
+
+# ---- HTML alert emails via SES (the heatmap needs HTML; SNS email is text only).
+# Sender domain is verified through Route 53 (TXT + Easy DKIM). Recipients are
+# the topic's confirmed email subscribers; while SES is in sandbox each one must
+# also be verified once by hand (it is an address, so it stays out of Terraform):
+#   aws sesv2 create-email-identity --email-identity <address>
+data "aws_route53_zone" "site" {
+  name = var.ses_domain
+}
+
+resource "aws_ses_domain_identity" "alerts" {
+  domain = var.ses_domain
+}
+
+resource "aws_route53_record" "ses_verification" {
+  zone_id = data.aws_route53_zone.site.zone_id
+  name    = "_amazonses.${var.ses_domain}"
+  type    = "TXT"
+  ttl     = 600
+  records = [aws_ses_domain_identity.alerts.verification_token]
+}
+
+resource "aws_ses_domain_dkim" "alerts" {
+  domain = aws_ses_domain_identity.alerts.domain
+}
+
+resource "aws_route53_record" "ses_dkim" {
+  count   = 3
+  zone_id = data.aws_route53_zone.site.zone_id
+  name    = "${aws_ses_domain_dkim.alerts.dkim_tokens[count.index]}._domainkey.${var.ses_domain}"
+  type    = "CNAME"
+  ttl     = 600
+  records = ["${aws_ses_domain_dkim.alerts.dkim_tokens[count.index]}.dkim.amazonses.com"]
 }

@@ -45,8 +45,20 @@ data "aws_iam_policy_document" "stock_screener_lambda" {
   statement {
     sid       = "PublishGexAlerts"
     effect    = "Allow"
-    actions   = ["sns:Publish"]
+    actions   = ["sns:Publish", "sns:ListSubscriptionsByTopic"]
     resources = [aws_sns_topic.gex_alerts.arn]
+  }
+
+  statement {
+    sid       = "SendGexAlertEmail"
+    effect    = "Allow"
+    actions   = ["ses:SendEmail"]
+    resources = ["arn:aws:ses:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:identity/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ses:FromAddress"
+      values   = ["alerts@${var.ses_domain}"]
+    }
   }
 
   statement {

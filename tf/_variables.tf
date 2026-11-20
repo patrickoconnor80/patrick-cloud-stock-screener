@@ -44,3 +44,9 @@ variable "gex_schedule_expression" {
     # and EDT. The handler skips runs outside market hours itself.
     default     = "cron(0/15 13-21 ? * MON-FRI *)"
 }
+
+variable "ses_domain" {
+  description = "Domain verified in SES as the alert email sender (hosted in Route 53)"
+  type        = string
+  default     = "patrick-cloud.com"
+}
