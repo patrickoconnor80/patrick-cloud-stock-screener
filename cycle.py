@@ -58,7 +58,7 @@ def nasdaq_listed() -> list[str]:
     """Nasdaq-listed operating companies (no ETFs, warrants, units, preferreds)."""
     txt = requests.get("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", headers=UA, timeout=30).text
     d = pd.read_csv(io.StringIO(txt), sep="|", dtype=str)
-    d = d[d.Symbol.notna() & ~d.Symbol.str.startswith("File Creation")]
+    d = d[d.Symbol.notna() & ~d.Symbol.str.startswith("File Creation", na=False)]
     d = d[(d.ETF == "N") & (d["Test Issue"] == "N") & (d["Financial Status"] == "N")]
     name = d["Security Name"].fillna("")
     keep = name.str.contains(r"Common Stock|Ordinary Share|Class [ABC]", case=False) & \

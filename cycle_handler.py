@@ -12,7 +12,9 @@ the GEX alert subscribers (same SNS/SES path as gex_handler) when:
     Topping within 20 days of an overheated one (once per turn).
 
 Alert state lives in cycle.json itself. A run with no previous file only seeds
-the state. Invoke with {"no_alerts": true} to refresh without emailing.
+the state. Invoke with {"no_alerts": true} to refresh without emailing, or
+{"sample_alert": true} to email a sample built from the latest cycle.json
+(no rebuild, state untouched).
 """
 
 import json
@@ -102,6 +104,15 @@ def lambda_handler(event, context):
     event = event if isinstance(event, dict) else {}
     s3 = boto3.client("s3")
     prev = previous(s3)
+    if event.get("sample_alert"):
+        if not prev:
+            return {"statusCode": 404, "error": "no cycle.json yet"}
+        name = {"Decline": "Washout", "Bottoming": "Bottoming after a washout"}.get(prev["phase"], prev["bucket"])
+        send(f"[Sample] Market cycle {prev['score']:+.0f}: {prev['bucket']}, phase {prev['phase']}",
+             f"Sample alert built from the {prev['as_of']} close (real data, not a live trigger).\n\n"
+             f"Market cycle {prev['score']:+.0f} ({prev['bucket']}, phase {prev['phase']}).\n\n"
+             + history_line(prev, name) + summary(prev))
+        return {"statusCode": 200, "sent": "sample"}
     c = cycle.build(screener.fetch_sp1500_universe())
 
     if prev is None:
