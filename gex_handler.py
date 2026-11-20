@@ -36,7 +36,7 @@ GEX_KEY = os.environ.get("GEX_KEY", "stock-screener/gex.json")
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
 ALERT_TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
 TRADIER_TOKEN_PARAM = os.environ.get("TRADIER_TOKEN_PARAM")   # SSM SecureString name
-SITE = "https://patrick-cloud.com/market.html"
+SITE = "https://patrick-cloud.com/data.html"
 
 
 def load_tradier_token():
