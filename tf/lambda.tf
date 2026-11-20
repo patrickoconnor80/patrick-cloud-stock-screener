@@ -36,7 +36,10 @@ data "aws_iam_policy_document" "stock_screener_lambda" {
       "s3:PutObject",
       "s3:GetObject"
     ]
-    resources = ["arn:aws:s3:::${var.website_bucket}/${var.results_key}"]
+    resources = [
+      "arn:aws:s3:::${var.website_bucket}/${var.results_key}",
+      "arn:aws:s3:::${var.website_bucket}/${var.gex_key}"
+    ]
   }
 
   statement {

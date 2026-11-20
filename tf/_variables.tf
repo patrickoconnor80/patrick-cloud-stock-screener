@@ -30,3 +30,17 @@ variable "schedule_expression" {
     # if true DST-correctness is needed.
     default     = "cron(1 20 ? * MON-FRI *)"
 }
+
+variable "gex_key" {
+    description = "S3 key (within website_bucket) the GEX Lambda writes its snapshot to"
+    type        = string
+    default     = "stock-screener/gex.json"
+}
+
+variable "gex_schedule_expression" {
+    description = "EventBridge schedule for the GEX snapshot (UTC)"
+    type        = string
+    # Every 15 min, 13:00-21:45 UTC on weekdays: covers 9:30-16:15 ET in both EST
+    # and EDT. The handler skips runs outside market hours itself.
+    default     = "cron(0/15 13-21 ? * MON-FRI *)"
+}
