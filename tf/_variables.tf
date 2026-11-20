@@ -50,3 +50,16 @@ variable "ses_domain" {
   type        = string
   default     = "patrick-cloud.com"
 }
+
+variable "cycle_key" {
+    description = "S3 key (within website_bucket) the market cycle Lambda writes to"
+    type        = string
+    default     = "stock-screener/cycle.json"
+}
+
+variable "cycle_schedule_expression" {
+    description = "EventBridge schedule for the market cycle readout (UTC)"
+    type        = string
+    # 22:30 UTC = 5:30pm EST / 6:30pm EDT, after Yahoo has the day's closes.
+    default     = "cron(30 22 ? * MON-FRI *)"
+}

@@ -10,7 +10,8 @@ on:
       - "Dockerfile"
       - "gex.py"
       - "gex_handler.py"
-      - "thermo.py"
+      - "cycle.py"
+      - "cycle_handler.py"
       - "events.json"
       - ".github/workflows/deploy-app.yml"
   workflow_dispatch:
@@ -76,6 +77,22 @@ jobs:
             cat /tmp/gex-output.json
           else
             echo "GEX function not created yet; run Terraform first."
+          fi
+
+      - name: Update market cycle Lambda code and refresh cycle.json
+        run: |
+          CYCLE_FUNCTION_NAME=patrick-cloud-dev-market-cycle
+          if aws lambda get-function --function-name "$CYCLE_FUNCTION_NAME" >/dev/null 2>&1; then
+            aws lambda update-function-code \
+              --function-name "$CYCLE_FUNCTION_NAME" \
+              --image-uri "${{ steps.build.outputs.image_uri }}"
+            aws lambda wait function-updated --function-name "$CYCLE_FUNCTION_NAME"
+            # no_alerts: a code deploy should not re-send the day's alerts
+            aws lambda invoke --cli-read-timeout 900 --function-name "$CYCLE_FUNCTION_NAME" \
+              --cli-binary-format raw-in-base64-out --payload '{"no_alerts": true}' /tmp/cycle-output.json
+            cat /tmp/cycle-output.json
+          else
+            echo "Market cycle function not created yet; run Terraform first."
           fi
 
       - name: Invoke once so the site refreshes immediately

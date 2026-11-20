@@ -6,13 +6,9 @@ to gex_handler.lambda_handler (see tf/gex.tf). EventBridge fires it every 15
 minutes on weekdays; the schedule is in UTC, so it is padded to cover market
 hours in both EST and EDT, and this handler skips runs outside 9:30-16:15 ET.
 
-Each run writes the snapshot to S3 for the website and emails (via SNS):
+Each run writes the snapshot to S3 for the website and emails (SES HTML, SNS text fallback):
   - a PIN alert the first time a ticker's pin setup turns ready for a given
     node and expiry (de-duplicated against the previous snapshot in S3), and
-  - a THERMOMETER alert when the daily market thermometer (thermo.py, stored in
-    results.json by the screener Lambda) enters the washout (<= -60) or
-    overheated (>= +60) zone. The zone is remembered in gex.json and only
-    resets once the score is back inside +/-40, so it fires once per extreme.
   - an EVENT heads-up once, in the 3:30-3:44pm ET run on the trading day
     before a scheduled event (or that morning's 9:30 run for Monday events).
 
@@ -41,7 +37,6 @@ import gex
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 GEX_KEY = os.environ.get("GEX_KEY", "stock-screener/gex.json")
-RESULTS_KEY = os.environ.get("RESULTS_KEY", "stock-screener/results.json")   # holds the thermometer
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
 ALERT_TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
 TRADIER_TOKEN_PARAM = os.environ.get("TRADIER_TOKEN_PARAM")   # SSM SecureString name
@@ -114,10 +109,9 @@ def heatmap_html(t, rows=21):
     cap = (f"{t['ticker']} ${spot:,.2f} &middot; dealers net {html.escape(regime)} gamma"
            + (f" &middot; flip {flip:g} (dashed line)" if flip else "")
            + " &middot; &#9664; = spot &middot; $ gamma per 1% move")
-    return (f'<div style="margin:18px 0 6px;font:600 14px -apple-system,Segoe UI,Arial;color:#111;">{t["ticker"]} gamma heatmap</div>'
-            f'<div style="overflow-x:auto;"><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#0b0b10;border-radius:6px;">'
+    return (f'<div style="overflow-x:auto;margin-top:4px;"><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#0b0b10;border-radius:6px;">'
             f'<tr><th style="{td}color:#9ca3af;">Strike</th>{head}</tr>{"".join(body)}</table></div>'
-            f'<div style="font:11px -apple-system,Segoe UI,Arial;color:#6b7280;margin-top:4px;max-width:420px;">{cap}</div>')
+            f'<div style="font:11px/1.5 {FONT};color:#6b7280;margin-top:6px;">{cap}</div>')
 
 
 def email_recipients():
@@ -134,26 +128,140 @@ def email_recipients():
         kw["NextToken"] = r["NextToken"]
 
 
-def send(subject, body, tickers=()):
+FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif"
+ACCENT = {"pin": "#0d9488", "event": "#d97706", "test": "#6b7280"}
+esc = html.escape
+
+
+class Email:
+    """One alert, built as an inline-styled HTML card (table layout, since email
+    clients drop <style> blocks and flexbox) and a matching plain-text body."""
+
+    def __init__(self, kicker, title, accent):
+        self.kicker, self.title, self.accent = kicker, title, accent
+        head = f"{kicker.upper()}: {title}"
+        self.h, self.t = [], [head, "=" * len(head), ""]
+
+    def lead(self, s):
+        self.h.append(f'<p style="margin:0 0 18px;font:16px/1.5 {FONT};color:#111827;">{esc(s)}</p>')
+        self.t += [s, ""]
+
+    def para(self, s, muted=False):
+        c, sz = ("#6b7280", 13) if muted else ("#374151", 14)
+        self.h.append(f'<p style="margin:0 0 12px;font:{sz}px/1.55 {FONT};color:{c};">{esc(s)}</p>')
+        self.t += [s, ""]
+
+    def callout(self, s):
+        self.h.append(f'<div style="margin:0 0 16px;padding:10px 14px;background:#fffbeb;border-left:4px solid #f59e0b;'
+                      f'border-radius:4px;font:14px/1.5 {FONT};color:#78350f;">{esc(s)}</div>')
+        self.t += [f"!! {s}", ""]
+
+    def heading(self, s):
+        self.h.append(f'<div style="margin:22px 0 10px;padding-top:16px;border-top:1px solid #e5e7eb;'
+                      f'font:700 11px {FONT};letter-spacing:.08em;text-transform:uppercase;color:#6b7280;">{esc(s)}</div>')
+        self.t += [s.upper(), "-" * len(s)]
+
+    def stats(self, pairs):
+        """Row of label-over-value tiles."""
+        cells = "".join(
+            f'<td style="padding:10px 12px;background:#f9fafb;border:1px solid #e5e7eb;vertical-align:top;">'
+            f'<div style="font:600 10px {FONT};letter-spacing:.06em;text-transform:uppercase;color:#6b7280;">{esc(k)}</div>'
+            f'<div style="font:700 17px/1.3 {FONT};color:#111827;margin-top:3px;white-space:nowrap;">{esc(str(v))}</div></td>'
+            for k, v in pairs)
+        self.h.append(f'<table cellspacing="0" cellpadding="0" width="100%" style="border-collapse:collapse;margin:0 0 18px;">'
+                      f'<tr>{cells}</tr></table>')
+        w = max(len(k) for k, _ in pairs)
+        self.t += [f"  {k:<{w}}  {v}" for k, v in pairs] + [""]
+
+    def table(self, rows, head=None):
+        """rows: lists of cells, first column left-aligned; a cell is text or (text, css color)."""
+        n = len(head or rows[0])
+        align = ["left"] + ["right"] * (n - 1)
+        txt = lambda c: c[0] if isinstance(c, tuple) else str(c)
+        out = []
+        if head:
+            out.append("<tr>" + "".join(
+                f'<th style="padding:6px 8px;text-align:{a};font:600 11px {FONT};color:#6b7280;border-bottom:2px solid #e5e7eb;">{esc(h)}</th>'
+                for h, a in zip(head, align)) + "</tr>")
+        for r in rows:
+            out.append("<tr>" + "".join(
+                f'<td style="padding:7px 8px;text-align:{a};font:{"600 " if i == 0 else ""}14px {FONT};'
+                f'color:{c[1] if isinstance(c, tuple) else "#111827"};border-bottom:1px solid #f3f4f6;">{esc(txt(c))}</td>'
+                for i, (c, a) in enumerate(zip(r, align))) + "</tr>")
+        self.h.append(f'<table cellspacing="0" cellpadding="0" width="100%" style="border-collapse:collapse;margin:0 0 8px;">{"".join(out)}</table>')
+        grid = ([head] if head else []) + [[txt(c) for c in r] for r in rows]
+        ws = [max(len(r[i]) for r in grid) for i in range(n)]
+        for j, r in enumerate(grid):
+            self.t.append("  " + "  ".join(c.ljust(w) if a == "left" else c.rjust(w) for c, w, a in zip(r, ws, align)).rstrip())
+            if head and j == 0:
+                self.t.append("  " + "  ".join("-" * w for w in ws))
+        self.t.append("")
+
+    def checks(self, items):
+        rows = "".join(
+            f'<tr><td style="padding:5px 10px 5px 0;width:22px;font:700 15px {FONT};color:{"#16a34a" if ok else "#9ca3af"};">'
+            f'{"&#10003;" if ok else "&#10007;"}</td>'
+            f'<td style="padding:5px 0;font:14px {FONT};color:{"#111827" if ok else "#6b7280"};">{esc(k)}</td></tr>'
+            for k, ok in items.items())
+        self.h.append(f'<table cellspacing="0" cellpadding="0" style="margin:0 0 8px;">{rows}</table>')
+        self.t += [f"  [{'x' if ok else ' '}] {k}" for k, ok in items.items()] + [""]
+
+    def raw(self, fragment):
+        """HTML-only content (the heatmaps)."""
+        if fragment:
+            self.h.append(fragment)
+
+    def html(self, footer=""):
+        button = (f'<table cellspacing="0" cellpadding="0" style="margin:26px 0 4px;"><tr>'
+                  f'<td style="background:{self.accent};border-radius:6px;">'
+                  f'<a href="{SITE}" style="display:inline-block;padding:11px 20px;font:600 14px {FONT};color:#ffffff;text-decoration:none;">'
+                  f'Open the live map &rarr;</a></td></tr></table>')
+        foot = f'<p style="margin:0;font:12px/1.5 {FONT};color:#9ca3af;">{esc(footer)}</p>' if footer else ""
+        return (f'<table cellspacing="0" cellpadding="0" width="100%" style="background:#f3f4f6;"><tr><td align="center" style="padding:24px 12px;">'
+                f'<table cellspacing="0" cellpadding="0" width="100%" style="max-width:640px;background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb;">'
+                f'<tr><td style="height:5px;background:{self.accent};font-size:0;line-height:0;">&nbsp;</td></tr>'
+                f'<tr><td style="padding:24px 28px 8px;" align="left">'
+                f'<div style="font:700 11px {FONT};letter-spacing:.1em;text-transform:uppercase;color:{self.accent};">{esc(self.kicker)}</div>'
+                f'<div style="font:700 24px/1.25 {FONT};color:#111827;margin:6px 0 16px;">{esc(self.title)}</div>'
+                + "".join(self.h) + button +
+                f'</td></tr><tr><td align="left" style="padding:16px 28px 22px;border-top:1px solid #f3f4f6;">{foot}'
+                f'<p style="margin:6px 0 0;font:12px {FONT};color:#9ca3af;">patrick-cloud.com &middot; GEX alerts</p>'
+                f'</td></tr></table></td></tr></table>')
+
+    def text(self, footer=""):
+        return "\n".join(self.t + [f"Live map: {SITE}", ""] + ([footer] if footer else [])).strip() + "\n"
+
+
+def send(subject, msg, footer=""):
     print(f"ALERT: {subject}")
     if not ALERT_TOPIC_ARN:
         return
+    body = msg.text(footer)
     if SES_FROM:
         try:
             to = email_recipients()
             if to:
-                text = html.escape(body).replace(html.escape(SITE), f'<a href="{SITE}">{SITE}</a>')
-                page = ('<div style="max-width:640px;font:14px/1.5 -apple-system,Segoe UI,Arial;color:#111;">'
-                        f'<div style="white-space:pre-wrap;">{text}</div>'
-                        + "".join(heatmap_html(t) for t in tickers) + "</div>")
                 boto3.client("ses").send_email(
                     Source=SES_FROM, Destination={"ToAddresses": to},
                     Message={"Subject": {"Data": subject[:200]},
-                             "Body": {"Text": {"Data": body}, "Html": {"Data": page}}})
+                             "Body": {"Text": {"Data": body}, "Html": {"Data": msg.html(footer)}}})
                 return
         except Exception as ex:   # fall back to the plain-text SNS email
             print(f"SES send failed ({type(ex).__name__}: {ex}); using SNS")
     boto3.client("sns").publish(TopicArn=ALERT_TOPIC_ARN, Subject=subject[:99], Message=body)
+
+
+def heatmaps(m, tickers):
+    for t in tickers:
+        frag = heatmap_html(t)
+        if frag:
+            m.heading(f"{t['ticker']} gamma heatmap")
+            m.raw(frag)
+
+
+def _day(iso):
+    d = date.fromisoformat(iso[:10])
+    return f"{d:%a %b} {d.day}"
 
 
 def previous_snapshot(s3):
@@ -168,69 +276,29 @@ def pin_alerts(payload, prev):
         (t["ticker"], t["pin"].get("node"), t["pin"].get("expiry"))
         for t in prev.get("tickers", []) if t.get("pin", {}).get("ready")
     }
+    today = payload["generated_at"][:10]
+    events_today = [e["name"] for e in payload.get("events", []) if e["date"] == today]
     for t in payload["tickers"]:
         pin = t.get("pin") or {}
         if not pin.get("ready") or (t["ticker"], pin["node"], pin["expiry"]) in was_ready:
             continue
-        today = payload["generated_at"][:10]
-        events_today = [e["name"] for e in payload.get("events", []) if e["date"] == today]
-        checks = "\n".join(f"  [{'x' if ok else ' '}] {k}" for k, ok in pin["checks"].items())
-        warn = f"\nWARNING: scheduled event today ({'; '.join(events_today)}). Pins break on news.\n" if events_today else ""
-        send(
-            f"{t['ticker']} pin setup at {pin['node']:g} (exp {pin['expiry'][5:]})",
-            f"{t['ticker']} ${t['spot']:.2f}: dealers net long gamma (flip {t['flip']}).\n"
-            f"Largest positive node near spot: {pin['node']:g} ({money(pin['node_gex'])}), expiring {pin['expiry']}.\n\n"
-            f"Checks:\n{checks}\n{warn}\n"
-            f"Pin structures centered on {pin['node']:g}: long call butterfly (debit) or short iron butterfly (credit).\n"
-            f"Not a short plain butterfly: that profits from movement away from the strike.\n\n"
-            f"Live map: {SITE}\n\nModel estimate from delayed Yahoo option chains; dealer positions are assumed, not observed.",
-            tickers=[t],
-        )
-
-
-THERMO_IN, THERMO_RESET = 60, 40
-
-
-def thermo_zone(s3, prev):
-    """(zone, thermometer): zone is "cold", "hot" or None, with hysteresis so a
-    score hovering around the line doesn't re-alert."""
-    last = prev.get("thermo_zone")
-    try:
-        t = json.loads(s3.get_object(Bucket=RESULTS_BUCKET, Key=RESULTS_KEY)["Body"].read()).get("thermometer")
-    except Exception as ex:
-        print(f"thermometer unavailable ({type(ex).__name__}); keeping zone {last}")
-        return last, None
-    if not t or t.get("score") is None:
-        return last, None
-    s = t["score"]
-    if s <= -THERMO_IN:
-        return "cold", t
-    if s >= THERMO_IN:
-        return "hot", t
-    if abs(s) < THERMO_RESET:
-        return None, t
-    return last, t
-
-
-def thermo_alert(t, zone, last):
-    if not zone or zone == last or not t:
-        return
-    comps = "\n".join(f"  {c['label']}: {c['value'] or '-'}  ({'+' if (c['temp'] or 0) > 0 else ''}{c['temp']})"
-                       for c in t["components"])
-    row = next((b for b in t["backtest"]["buckets"] if b["bucket"] == t["bucket"]), None)
-    base = t["backtest"]["baseline"]
-    hist = (f"Past days in this zone ({row['days']}): SPY averaged {row['avg20']:+.2f}% over the next month and "
-            f"{row['avg60']:+.2f}% over 3 months (all days: {base['avg20']:+.2f}% / {base['avg60']:+.2f}%).\n\n") if row else ""
-    read = ("Fear, breadth and momentum are washed out together. Readings like this have clustered near "
-            "short-term lows; look for the reversal day rather than catching the first dip."
-            if zone == "cold" else
-            "Momentum and breadth are stretched. Overheated readings have still averaged gains, just smaller ones; "
-            "treat it as a reason to tighten stops and trim size, not as a short signal.")
-    send(f"Market thermometer {t['score']:+.0f}: {t['bucket']}",
-         f"The market thermometer closed {t['as_of']} at {t['score']:+.0f} ({t['bucket']}), "
-         f"{'below -' if zone == 'cold' else 'above +'}{THERMO_IN}.\n\n{read}\n\n{hist}"
-         f"Components (temperature -100 cold .. +100 hot):\n{comps}\n\n"
-         f"Full readout: {SITE}\n\nNot a recommendation to trade.")
+        node = f"{pin['node']:g}"
+        m = Email("Pin alert", f"{t['ticker']} pin setup at {node}", ACCENT["pin"])
+        m.lead(f"Dealers are net long gamma in {t['ticker']}, and the largest positive gamma node near spot is "
+               f"{node}, expiring {_day(pin['expiry'])}. Every pin check passes.")
+        m.stats([("Spot", f"${t['spot']:,.2f}"), ("Pin node", node), ("Node gamma", money(pin["node_gex"])),
+                 ("Gamma flip", f"{t['flip']:g}" if t.get("flip") else "-")])
+        if events_today:
+            m.callout(f"Scheduled event today: {'; '.join(events_today)}. Pins break on news.")
+        m.heading("Pin checks")
+        m.checks(pin["checks"])
+        m.heading("How to play it")
+        m.para(f"Pin structures centered on {node}: a long call butterfly (debit) or a short iron butterfly (credit).")
+        m.para("Not a short plain butterfly: that profits from movement away from the strike.", muted=True)
+        heatmaps(m, [t])
+        send(f"{t['ticker']} pin setup at {node} (exp {pin['expiry'][5:].replace('-', '/')})", m,
+             footer=f"Model estimate from {payload.get('source') or 'delayed option chains'}. "
+                    "Dealer positions are assumed, not observed.")
 
 
 def next_trading_day(d: date) -> date:
@@ -249,26 +317,37 @@ def event_alerts(payload, now):
               (in_morning_slot and d == now.date() and now.weekday() == 0)  # Monday events: weekend gap
         if not due:
             continue
-        moves = "\n".join(
-            f"  {x['ticker']}: +/-{x['move_pct']:.2f}% (ATM {x['strike']:g} straddle ${x['straddle']:.2f}, through {x['expiry']})"
-            for x in e.get("implied", []) if x.get("move_pct")
-        ) or "  (not priced yet)"
-        regimes = ", ".join(f"{t['ticker']} {t.get('regime', '?')} gamma" for t in payload["tickers"])
-        send(
-            f"Event {d:%a %b %d}: {e['name']}",
-            f"{e['name']}: {d:%A %b %d} at {e.get('time', '?')} ET.\n\n"
-            f"Implied move:\n{moves}\n\nDealer regime now: {regimes}.\n\n"
-            f"IV-crush structures (short iron butterfly / iron condor) collect this premium and win if the actual move is "
-            f"smaller than implied. In short gamma, a worse-than-priced print runs: keep defined-risk wings.\n\n"
-            f"Calendar and live map: {SITE}",
-            tickers=[t for t in payload["tickers"] if not t.get("error")],
-        )
+        implied = [x for x in e.get("implied", []) if x.get("move_pct")]
+        live = [t for t in payload["tickers"] if not t.get("error")]
+        m = Email("Event heads-up", e["name"], ACCENT["event"])
+        m.lead(f"{e['name']} is scheduled for {d:%A, %B} {d.day} at {e.get('time', '?')} ET.")
+        m.heading("Implied move")
+        if implied:
+            m.table([[x["ticker"], f"±{x['move_pct']:.2f}%", f"{x['strike']:g}", f"${x['straddle']:.2f}", _day(x["expiry"])]
+                     for x in implied],
+                    head=["", "Move", "ATM strike", "Straddle", "Through"])
+        else:
+            m.para("Not priced yet.", muted=True)
+        m.heading("Dealer regime now")
+        m.table([[t["ticker"],
+                  (f"{t.get('regime', '?')} gamma",
+                   {"long": "#0d9488", "short": "#c026d3"}.get(t.get("regime"), "#111827")),
+                  f"${t['spot']:,.2f}"] for t in live],
+                head=["", "Regime", "Spot"])
+        m.heading("Playbook")
+        m.para("IV-crush structures (short iron butterfly / iron condor) collect this premium and win if the actual "
+               "move is smaller than implied.")
+        m.para("In short gamma, a worse-than-priced print runs: keep defined-risk wings.", muted=True)
+        heatmaps(m, live)
+        send(f"Event {d:%a %b} {d.day}: {e['name']}", m, footer="Not a recommendation to trade.")
 
 
 def lambda_handler(event, context):
     event = event if isinstance(event, dict) else {}
     if event.get("test_alert"):
-        send("GEX alerts: test", f"Email alerts from the GEX Lambda are working.\n\n{SITE}")
+        m = Email("Test", "Email alerts are working", ACCENT["test"])
+        m.lead("This is a test message from the GEX Lambda. Pin and event alerts arrive in this format.")
+        send("GEX alerts: test", m)
         return {"statusCode": 200, "sent": "test"}
 
     now = datetime.now(gex.ET)
@@ -279,8 +358,6 @@ def lambda_handler(event, context):
     load_tradier_token()
     prev = previous_snapshot(s3)
     payload = gex.build_snapshot()
-    zone, thermometer = thermo_zone(s3, prev)
-    payload["thermo_zone"] = zone
     s3.put_object(
         Bucket=RESULTS_BUCKET,
         Key=GEX_KEY,
@@ -297,8 +374,7 @@ def lambda_handler(event, context):
             },
         )
 
-    for fn, args in ((pin_alerts, (payload, prev)), (event_alerts, (payload, now)),
-                     (thermo_alert, (thermometer, zone, prev.get("thermo_zone")))):
+    for fn, args in ((pin_alerts, (payload, prev)), (event_alerts, (payload, now))):
         try:
             fn(*args)
         except Exception as ex:   # alerting must never block the snapshot

@@ -38,7 +38,8 @@ data "aws_iam_policy_document" "stock_screener_lambda" {
     ]
     resources = [
       "arn:aws:s3:::${var.website_bucket}/${var.results_key}",
-      "arn:aws:s3:::${var.website_bucket}/${var.gex_key}"
+      "arn:aws:s3:::${var.website_bucket}/${var.gex_key}",
+      "arn:aws:s3:::${var.website_bucket}/${var.cycle_key}"
     ]
   }
 
