@@ -135,6 +135,43 @@ def rnd(x, n=1):
     return None if math.isnan(x) or math.isinf(x) else round(x, n)
 
 
+# Chart reference lines per indicator. "pct" = percentile-scored, so the
+# lines are drawn at that series' own 10th/90th percentiles.
+LINES = {
+    "vix": [(28.3, "fear high", "cold"), (14.3, "complacent", "hot")],
+    "vix_wrsi": [(70, "fear spike", "cold"), (35, "calm", "hot")],
+    "vix_term": [(1.0, "backwardation", "cold"), (0.82, "calm", "hot")],
+    "mco_broad": "pct", "mco_ndx": "pct", "spy_ext": "pct",
+    "above50": [(80, "stretched", "hot"), (20, "washout", "cold")],
+    "nas200": [(75, "stretched", "hot"), (25, "correction", "cold"), (15, "accumulate", "cold")],
+    "spy_rsi": [(70, "overbought", "hot"), (30, "oversold", "cold")],
+    "qqq_rsi": [(70, "overbought", "hot"), (30, "oversold", "cold")],
+}
+HIGH_IS_COLD = {"vix", "vix_wrsi", "vix_term"}   # fear gauges: high readings = oversold stocks
+
+
+def component_detail(key, raw_s, temp_s, last):
+    """Chart history since 2019, reference lines, and how rare today's reading is."""
+    s = raw_s.dropna()
+    v, t = raw_s.get(last), temp_s.get(last)
+    lines = LINES[key]
+    if lines == "pct":
+        lines = [(float(s.quantile(.9)), "top 10%", "hot"), (float(s.quantile(.1)), "bottom 10%", "cold")]
+    out = {"hist": [rnd(x, 3) for x in raw_s[raw_s.index >= "2019-01-01"]],
+           "lines": [{"v": rnd(lv, 3), "label": lab, "side": side} for lv, lab, side in lines]}
+    if v is None or pd.isna(v) or t is None or pd.isna(t):
+        return out
+    cold = t < 0
+    low_side = cold != (key in HIGH_IS_COLD)        # is "more extreme" a lower number?
+    hit = (s <= v) if low_side else (s >= v)
+    # last time it was at least this extreme before the current run (skip the last 20 sessions)
+    prior = hit[hit & (hit.index < s.index[-20])] if len(s) > 20 else hit[:0]
+    out["rarity"] = {"pct": rnd(hit.mean() * 100, 1), "dir": "low" if low_side else "high",
+                     "side": "cold" if cold else "hot", "since": s.index[0].strftime("%Y"),
+                     "last": prior.index[-1].strftime("%Y-%m-%d") if len(prior) else None}
+    return out
+
+
 def phase_of(level, slope):
     if level < 0:
         return "Decline" if slope < 0 else "Bottoming"
@@ -312,6 +349,9 @@ def build(sp1500: list[str]) -> dict:
               "value": None if pd.isna(raw.at[last, k]) else fmt.format(raw.at[last, k]),
               "temp": None if pd.isna(temp.at[last, k]) else round(float(temp.at[last, k]))}
              for k, (lab, note, fmt) in meta.items()]
+    comp_dates = [d.strftime("%Y-%m-%d") for d in idx[idx >= "2019-01-01"]]
+    for c in comps:
+        c.update(component_detail(c["key"], raw[c["key"]], temp[c["key"]], last))
 
     hist = pd.DataFrame({"s": score, "m": smooth, "sl": slope, "spy": spy.Close}).dropna()
     hist = hist[hist.index >= "2019-01-01"]   # covers the 2020 crash and the 2022 bear market
@@ -329,6 +369,7 @@ def build(sp1500: list[str]) -> dict:
         "bucket": next(n for lo, hi, n in BUCKETS if lo < score[last] <= hi),
         "phase": phase[last],
         "components": comps,
+        "comp_dates": comp_dates,
         "history": [{"d": d.strftime("%Y-%m-%d"), "s": rnd(r.s), "m": rnd(r.m), "sl": rnd(r.sl), "spy": rnd(r.spy, 2)}
                     for d, r in hist.iterrows()],
         "breadth200": {"now": rnd(nas200.dropna().iloc[-1]), "members": int(nas.shape[1]),
