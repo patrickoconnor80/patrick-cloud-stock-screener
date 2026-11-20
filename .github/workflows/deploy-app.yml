@@ -8,6 +8,9 @@ on:
       - "lambda_handler.py"
       - "requirements.txt"
       - "Dockerfile"
+      - "gex.py"
+      - "gex_handler.py"
+      - "events.json"
 
 permissions:
   id-token: write
@@ -15,6 +18,7 @@ permissions:
 
 env:
   FUNCTION_NAME: patrick-cloud-dev-stock-screener
+  GEX_FUNCTION_NAME: patrick-cloud-dev-gex
   ECR_REPOSITORY: patrick-cloud-dev-stock-screener
 
 jobs:
@@ -52,6 +56,22 @@ jobs:
             --function-name "$FUNCTION_NAME" \
             --image-uri "${{ steps.build.outputs.image_uri }}"
           aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+      - name: Update GEX Lambda code and refresh gex.json
+        run: |
+          # Same image, different entrypoint (image_config in tf/gex.tf). Skip if
+          # Terraform hasn't created the function yet.
+          if aws lambda get-function --function-name "$GEX_FUNCTION_NAME" >/dev/null 2>&1; then
+            aws lambda update-function-code \
+              --function-name "$GEX_FUNCTION_NAME" \
+              --image-uri "${{ steps.build.outputs.image_uri }}"
+            aws lambda wait function-updated --function-name "$GEX_FUNCTION_NAME"
+            aws lambda invoke --cli-read-timeout 300 --function-name "$GEX_FUNCTION_NAME" \
+              --cli-binary-format raw-in-base64-out --payload '{"force": true}' /tmp/gex-output.json
+            cat /tmp/gex-output.json
+          else
+            echo "GEX function not created yet; run Terraform first."
+          fi
 
       - name: Invoke once so the site refreshes immediately
         run: |
