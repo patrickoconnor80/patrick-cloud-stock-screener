@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 import boto3
 
 import screener
+import thermo
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 RESULTS_KEY = os.environ.get("RESULTS_KEY", "stock-screener/results.json")
@@ -53,7 +54,18 @@ def run_screen() -> dict:
 
 
 def lambda_handler(event, context):
+    # Market thermometer (top/bottom gauge on data.html). It rides along in
+    # results.json so the Lambda needs no new S3 key; a failure here must not
+    # block the screen.
+    try:
+        thermometer = thermo.build(screener.fetch_sp1500_universe())
+        print(f"thermometer {thermometer['as_of']}: {thermometer['score']} ({thermometer['bucket']})")
+    except Exception as ex:
+        thermometer = None
+        print(f"thermometer failed: {type(ex).__name__}: {ex}")
+
     payload = run_screen()
+    payload["thermometer"] = thermometer
 
     s3 = boto3.client("s3")
     s3.put_object(

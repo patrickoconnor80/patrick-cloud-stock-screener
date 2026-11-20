@@ -10,6 +10,7 @@ on:
       - "Dockerfile"
       - "gex.py"
       - "gex_handler.py"
+      - "thermo.py"
       - "events.json"
       - ".github/workflows/deploy-app.yml"
   workflow_dispatch:
