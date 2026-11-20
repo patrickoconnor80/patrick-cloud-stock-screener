@@ -11,6 +11,8 @@ on:
       - "gex.py"
       - "gex_handler.py"
       - "events.json"
+      - ".github/workflows/deploy-app.yml"
+  workflow_dispatch:
 
 permissions:
   id-token: write
