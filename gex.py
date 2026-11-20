@@ -31,8 +31,9 @@ ET = ZoneInfo("America/New_York")
 EVENTS = Path(__file__).resolve().parent / "events.json"
 
 RATE = 0.04            # risk-free rate for Black-Scholes
-DAYS_AHEAD = 7         # expirations included in the "whole book" profile
+DAYS_AHEAD = 10        # expirations included in the "whole book" profile and grid
 BAND = 0.03            # strikes within +/-3% of spot go in the published profile
+GRID_BAND = 0.025      # strikes within +/-2.5% of spot go in the heatmap grid
 PIN_MAX_DIST = 0.006   # pin node must be within 0.6% of spot
 PIN_WINDOW = (time(10, 30), time(14, 30))   # ET, expiration day
 EVE_WINDOW = (time(13, 0), time(16, 15))    # ET, day before expiration
@@ -127,6 +128,15 @@ def ticker_snapshot(ticker: str, now: datetime) -> dict:
                for k in band_keys]
     king = max(band_keys, key=lambda k: abs(book[k])) if band_keys else None
 
+    # ---- heatmap grid: strikes (rows) x expirations (columns), like a vendor GEX map
+    per_exp = {e: gex_by_strike(rows, spot, only_exp=e)[0] for e in expiries}
+    grid_strikes = [k for k in band_keys if abs(k - spot) / spot <= GRID_BAND]
+    grid = {
+        "expiries": [e.isoformat() for e in expiries],
+        "strikes": grid_strikes,
+        "values": [[round(per_exp[e].get(k, 0)) for e in expiries] for k in grid_strikes],
+    }
+
     # ---- pin setup on the nearest expiry
     band2 = {k: v for k, v in near.items() if abs(k - spot) / spot <= 0.02}
     pos = {k: v for k, v in band2.items() if v > 0}
@@ -158,6 +168,7 @@ def ticker_snapshot(ticker: str, now: datetime) -> dict:
         "king": {"strike": king, "gex": round(book[king])} if king else None,
         "pin": pin,
         "profile": profile,
+        "grid": grid,
     }
 
 
