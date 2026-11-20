@@ -25,7 +25,7 @@ import boto3
 
 import cycle
 import screener
-from gex_handler import send
+from gex_handler import Email, send
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 CYCLE_KEY = os.environ.get("CYCLE_KEY", "stock-screener/cycle.json")
@@ -49,23 +49,34 @@ def zone_of(score, last):
     return None if abs(score) < ZONE_RESET else last
 
 
-def summary(c):
-    comps = "\n".join(f"  {x['label']}: {x['value'] or '-'}  ({'+' if (x['temp'] or 0) > 0 else ''}{x['temp']})"
-                      for x in c["components"])
-    m = c["macro"]
-    macro = "\n".join(f"  {i['label']}: {i['value']} ({i['change']}) - {i['signal']}" for i in m["items"])
-    return (f"Components (-100 cold .. +100 hot):\n{comps}\n\n"
-            f"Beta: {c['beta']['status']}.\nMacro backdrop for beta: {m['overall']}\n{macro}\n\n"
-            f"Full readout: {SITE}\n\nNot a recommendation to trade.")
+COLD, HOT = "#2563eb", "#dc2626"
 
 
-def history_line(c, name):
-    row = next((r for r in c["backtest"]["buckets"] + c["backtest"]["setups"] if r["name"] == name), None)
-    b = c["backtest"]["baseline"]
-    if not row:
-        return ""
-    return (f"Past days like this ({row['days']}): next 3 months SPY {row['spy60']:+.1f}%, high-beta SPHB "
-            f"{row['sphb60']:+.1f}% (all days: SPY {b['spy60']:+.1f}%, SPHB {b['sphb60']:+.1f}%).\n\n")
+def card(c, kicker, title, lead, setup, accent):
+    """Alert email in the shared GEX card layout."""
+    m = Email(kicker, title, accent)
+    m.lead(lead)
+    m.stats([("Score", f"{c['score']:+.0f}"), ("Reading", c["bucket"]), ("Phase", c["phase"]),
+             ("Close", c["as_of"])])
+    b = c["backtest"]
+    row = next((r for r in b["buckets"] + b["phases"] + b["setups"] if r["name"] == setup), None)
+    if row:
+        m.heading("What happened next, " + b["from"][:4] + "-" + b["to"][:4])
+        fmt = lambda v: "-" if v is None else f"{v:+.1f}%"
+        base = b["baseline"]
+        m.table([[f"{setup} ({row['days']} days)", fmt(row["spy20"]), fmt(row["spy60"]), fmt(row["sphb20"]), fmt(row["sphb60"])],
+                 [("All days", "#6b7280"), fmt(base["spy20"]), fmt(base["spy60"]), fmt(base["sphb20"]), fmt(base["sphb60"])]],
+                head=["", "SPY 1 mo", "SPY 3 mo", "SPHB 1 mo", "SPHB 3 mo"])
+    m.heading("What is in the score")
+    m.table([[x["label"], x["value"] or "-",
+              (f"{x['temp']:+d}" if x["temp"] is not None else "-", COLD if (x["temp"] or 0) < 0 else HOT)]
+             for x in c["components"]], head=["", "Value", "-100 cold / +100 hot"])
+    mac = c["macro"]
+    m.heading(f"High beta: {c['beta']['status']} - Macro backdrop: {mac['overall']}")
+    sig = {"tailwind": "#16a34a", "headwind": "#dc2626", "neutral": "#6b7280"}
+    m.table([[i["label"], i["value"], i["change"], (i["signal"], sig[i["signal"]])] for i in mac["items"]])
+    m.para("Model readout from delayed Yahoo data; breadth uses today's index members. Not a recommendation to trade.", muted=True)
+    return m
 
 
 def alerts(c, state):
@@ -73,30 +84,32 @@ def alerts(c, state):
     zone = zone_of(c["score"], state.get("zone"))
     hist = c["history"][-20:]
     lo20, hi20 = min(h["s"] for h in hist), max(h["s"] for h in hist)
-    head = f"Market cycle {c['score']:+.0f} ({c['bucket']}, phase {c['phase']}) at the {c['as_of']} close.\n\n"
 
     if zone and zone != state.get("zone"):
         if zone == "cold":
             send(f"Market cycle {c['score']:+.0f}: Washout",
-                 head + "Fear, breadth and momentum are washed out together. Readings like this have clustered "
-                 "near short-term lows; the better entry has been the turn (a Bottoming alert follows when the "
-                 "score starts rising) rather than the first dip.\n\n" + history_line(c, "Washout") + summary(c))
+                 card(c, "Market cycle", f"Washout: score {c['score']:+.0f}",
+                      "Fear, breadth and momentum are washed out together. Readings like this have clustered near "
+                      "short-term lows; the better entry has been the turn (a Bottoming alert follows when the score "
+                      "starts rising) rather than the first dip.", "Washout", COLD))
         else:
             send(f"Market cycle {c['score']:+.0f}: Overheated",
-                 head + "Momentum and breadth are stretched. The index has still tended to grind higher, but "
-                 "high-beta stocks have historically gone nowhere over the following 3 months from here: "
-                 "a time to tighten stops and trim beta, not to short.\n\n" + history_line(c, "Overheated") + summary(c))
+                 card(c, "Market cycle", f"Overheated: score {c['score']:+.0f}",
+                      "Momentum and breadth are stretched. The index has still tended to grind higher, but high-beta "
+                      "stocks have historically gone nowhere over the next 3 months from here: tighten stops and trim "
+                      "beta rather than short.", "Overheated", HOT))
 
     turn = state.get("phase") != c["phase"]
     if turn and c["phase"] == "Bottoming" and lo20 <= -ZONE_IN:
         send(f"Market cycle turning up after a washout ({c['score']:+.0f})",
-             head + "The score is rising off a washout reading from the last 20 sessions: the turn that has marked "
-                    "tradeable lows.\n\n" + history_line(c, "Bottoming after a washout") + summary(c))
+             card(c, "Market cycle", "Turning up after a washout",
+                  "The score is rising off a washout reading from the last 20 sessions: the turn that has marked "
+                  "tradeable lows.", "Bottoming after a washout", COLD))
     if turn and c["phase"] == "Topping" and hi20 >= ZONE_IN:
         send(f"Market cycle rolling over after overheating ({c['score']:+.0f})",
-             head + "The score is falling from an overheated reading in the last 20 sessions. Tops are processes: "
-                    "watch beta leadership (SPHB/SPLV) and Nasdaq breadth for confirmation.\n\n"
-             + history_line(c, "Topping after overheated") + summary(c))
+             card(c, "Market cycle", "Rolling over after overheating",
+                  "The score is falling from an overheated reading in the last 20 sessions. Tops are processes: "
+                  "watch beta leadership (SPHB/SPLV) and Nasdaq breadth for confirmation.", "Topping after overheated", HOT))
     return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"]}
 
 
@@ -107,11 +120,11 @@ def lambda_handler(event, context):
     if event.get("sample_alert"):
         if not prev:
             return {"statusCode": 404, "error": "no cycle.json yet"}
-        name = {"Decline": "Washout", "Bottoming": "Bottoming after a washout"}.get(prev["phase"], prev["bucket"])
+        setup = "Bottoming after a washout" if prev["phase"] == "Bottoming" else prev["bucket"]
         send(f"[Sample] Market cycle {prev['score']:+.0f}: {prev['bucket']}, phase {prev['phase']}",
-             f"Sample alert built from the {prev['as_of']} close (real data, not a live trigger).\n\n"
-             f"Market cycle {prev['score']:+.0f} ({prev['bucket']}, phase {prev['phase']}).\n\n"
-             + history_line(prev, name) + summary(prev))
+             card(prev, "Market cycle - sample", f"{prev['bucket']}: score {prev['score']:+.0f}, phase {prev['phase']}",
+                  f"Sample built from the {prev['as_of']} close: real data, not a live trigger.",
+                  setup, COLD if prev["score"] < 0 else HOT))
         return {"statusCode": 200, "sent": "sample"}
     c = cycle.build(screener.fetch_sp1500_universe())
 
