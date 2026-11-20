@@ -50,6 +50,13 @@ data "aws_iam_policy_document" "stock_screener_lambda" {
   }
 
   statement {
+    sid       = "ReadTradierToken"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${local.tradier_token_param}"]
+  }
+
+  statement {
     sid    = "InvalidateCache"
     effect = "Allow"
     actions = [

@@ -21,6 +21,9 @@ resource "aws_lambda_function" "gex" {
       GEX_KEY                    = var.gex_key
       CLOUDFRONT_DISTRIBUTION_ID = var.cloudfront_distribution_id
       ALERT_TOPIC_ARN            = aws_sns_topic.gex_alerts.arn
+      # SecureString created by hand (not in Terraform, so the token stays out of
+      # state). Absent = the Lambda uses Yahoo SPY/QQQ instead of Tradier SPX/NDX.
+      TRADIER_TOKEN_PARAM = local.tradier_token_param
     }
   }
 

@@ -35,7 +35,20 @@ RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 GEX_KEY = os.environ.get("GEX_KEY", "stock-screener/gex.json")
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
 ALERT_TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
+TRADIER_TOKEN_PARAM = os.environ.get("TRADIER_TOKEN_PARAM")   # SSM SecureString name
 SITE = "https://patrick-cloud.com/market.html"
+
+
+def load_tradier_token():
+    """Put the Tradier token from SSM into the env for gex.pick_source(). Missing
+    parameter = no token = Yahoo SPY/QQQ fallback."""
+    if os.environ.get("TRADIER_TOKEN") or not TRADIER_TOKEN_PARAM:
+        return
+    try:
+        p = boto3.client("ssm").get_parameter(Name=TRADIER_TOKEN_PARAM, WithDecryption=True)
+        os.environ["TRADIER_TOKEN"] = p["Parameter"]["Value"].strip()
+    except Exception as ex:
+        print(f"No Tradier token ({type(ex).__name__}); using Yahoo SPY/QQQ")
 
 
 def money(n):
@@ -123,6 +136,7 @@ def lambda_handler(event, context):
         return {"statusCode": 204, "skipped": "outside market hours"}
 
     s3 = boto3.client("s3")
+    load_tradier_token()
     prev = previous_snapshot(s3)
     payload = gex.build_snapshot()
     s3.put_object(
