@@ -459,12 +459,23 @@ def build_snapshot(src=None) -> dict:
     src = src or pick_source()
     now = datetime.now(ET)
     tickers = src.tickers
+    snaps = [ticker_snapshot(src, t, now) for t in tickers]
+    events = events_snapshot(src, tickers, now)
+    for s in snaps:
+        if s.get("error"):
+            continue
+        s["index"] = index_info(s["ticker"], s["spot"])   # None for SPX/NDX themselves
+        try:
+            s["outlook"] = build_outlook(s, events, now)
+        except Exception as ex:   # the outlook is commentary; never drop the snapshot over it
+            print(f"outlook {s['ticker']}: {ex}")
+            s["outlook"] = []
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "source": src.name,
         "convention": "dealers long calls (+), short puts (-); GEX in $ per 1% move",
-        "tickers": [ticker_snapshot(src, t, now) for t in tickers],
-        "events": events_snapshot(src, tickers, now),
+        "tickers": snaps,
+        "events": events,
     }
 
 
