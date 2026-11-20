@@ -9,6 +9,10 @@ hours in both EST and EDT, and this handler skips runs outside 9:30-16:15 ET.
 Each run writes the snapshot to S3 for the website and emails (via SNS):
   - a PIN alert the first time a ticker's pin setup turns ready for a given
     node and expiry (de-duplicated against the previous snapshot in S3), and
+  - a THERMOMETER alert when the daily market thermometer (thermo.py, stored in
+    results.json by the screener Lambda) enters the washout (<= -60) or
+    overheated (>= +60) zone. The zone is remembered in gex.json and only
+    resets once the score is back inside +/-40, so it fires once per extreme.
   - an EVENT heads-up once, in the 3:30-3:44pm ET run on the trading day
     before a scheduled event (or that morning's 9:30 run for Monday events).
 
@@ -37,6 +41,7 @@ import gex
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 GEX_KEY = os.environ.get("GEX_KEY", "stock-screener/gex.json")
+RESULTS_KEY = os.environ.get("RESULTS_KEY", "stock-screener/results.json")   # holds the thermometer
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
 ALERT_TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
 TRADIER_TOKEN_PARAM = os.environ.get("TRADIER_TOKEN_PARAM")   # SSM SecureString name
@@ -183,6 +188,51 @@ def pin_alerts(payload, prev):
         )
 
 
+THERMO_IN, THERMO_RESET = 60, 40
+
+
+def thermo_zone(s3, prev):
+    """(zone, thermometer): zone is "cold", "hot" or None, with hysteresis so a
+    score hovering around the line doesn't re-alert."""
+    last = prev.get("thermo_zone")
+    try:
+        t = json.loads(s3.get_object(Bucket=RESULTS_BUCKET, Key=RESULTS_KEY)["Body"].read()).get("thermometer")
+    except Exception as ex:
+        print(f"thermometer unavailable ({type(ex).__name__}); keeping zone {last}")
+        return last, None
+    if not t or t.get("score") is None:
+        return last, None
+    s = t["score"]
+    if s <= -THERMO_IN:
+        return "cold", t
+    if s >= THERMO_IN:
+        return "hot", t
+    if abs(s) < THERMO_RESET:
+        return None, t
+    return last, t
+
+
+def thermo_alert(t, zone, last):
+    if not zone or zone == last or not t:
+        return
+    comps = "\n".join(f"  {c['label']}: {c['value'] or '-'}  ({'+' if (c['temp'] or 0) > 0 else ''}{c['temp']})"
+                       for c in t["components"])
+    row = next((b for b in t["backtest"]["buckets"] if b["bucket"] == t["bucket"]), None)
+    base = t["backtest"]["baseline"]
+    hist = (f"Past days in this zone ({row['days']}): SPY averaged {row['avg20']:+.2f}% over the next month and "
+            f"{row['avg60']:+.2f}% over 3 months (all days: {base['avg20']:+.2f}% / {base['avg60']:+.2f}%).\n\n") if row else ""
+    read = ("Fear, breadth and momentum are washed out together. Readings like this have clustered near "
+            "short-term lows; look for the reversal day rather than catching the first dip."
+            if zone == "cold" else
+            "Momentum and breadth are stretched. Overheated readings have still averaged gains, just smaller ones; "
+            "treat it as a reason to tighten stops and trim size, not as a short signal.")
+    send(f"Market thermometer {t['score']:+.0f}: {t['bucket']}",
+         f"The market thermometer closed {t['as_of']} at {t['score']:+.0f} ({t['bucket']}), "
+         f"{'below -' if zone == 'cold' else 'above +'}{THERMO_IN}.\n\n{read}\n\n{hist}"
+         f"Components (temperature -100 cold .. +100 hot):\n{comps}\n\n"
+         f"Full readout: {SITE}\n\nNot a recommendation to trade.")
+
+
 def next_trading_day(d: date) -> date:
     d += timedelta(days=1)
     while d.weekday() >= 5:
@@ -229,6 +279,8 @@ def lambda_handler(event, context):
     load_tradier_token()
     prev = previous_snapshot(s3)
     payload = gex.build_snapshot()
+    zone, thermometer = thermo_zone(s3, prev)
+    payload["thermo_zone"] = zone
     s3.put_object(
         Bucket=RESULTS_BUCKET,
         Key=GEX_KEY,
@@ -245,7 +297,8 @@ def lambda_handler(event, context):
             },
         )
 
-    for fn, args in ((pin_alerts, (payload, prev)), (event_alerts, (payload, now))):
+    for fn, args in ((pin_alerts, (payload, prev)), (event_alerts, (payload, now)),
+                     (thermo_alert, (thermometer, zone, prev.get("thermo_zone")))):
         try:
             fn(*args)
         except Exception as ex:   # alerting must never block the snapshot
