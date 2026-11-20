@@ -89,6 +89,37 @@ def upload_charts(c, s3):
     return {"macro": SITE_ROOT + key}
 
 
+BREAK = "#ea580c"
+
+
+def break_card(c, r, kicker="High beta"):
+    """Trailing-stop email: SPHB broke its 20-day trend just off a 52-week high."""
+    m = Email(kicker, f"High-beta trend break: SPHB {r['off_peak']:+.1f}% from its high", BREAK)
+    m.lead(f"SPHB closed at {r['sphb']:.2f}, {abs(r['below_ema']):.1f}% under its 20-day EMA and {abs(r['off_peak']):.1f}% "
+           f"below the {r['peak']:.2f} high of {r['peak_d']}. This is the trailing-stop cue for high-beta positions: "
+           "the leading trend has broken. It is not a top call: it fires after the peak, and high beta has often "
+           "recovered from here.")
+    m.stats([("SPHB", f"{r['sphb']:.2f}"), ("Off high", f"{r['off_peak']:+.1f}%"), ("Cycle score", f"{c['score']:+.0f}"),
+             ("Beta", c["beta"]["status"].replace("Beta ", ""))])
+    past = [s for s in c.get("signals", []) if s["kind"] == "trend_break" and s.get("sphb60") is not None]
+    if past:
+        avg = lambda k: sum(s[k] for s in past) / len(past)
+        fmt = lambda v: f"{v:+.1f}%"
+        b = c["backtest"]["baseline"]
+        m.heading(f"After the past {len(past)} breaks since {past[0]['d'][:4]}")
+        m.table([["Trend break", fmt(avg("sphb20")), fmt(avg("sphb60")), fmt(avg("sphb_low60"))],
+                 [("All days", "#6b7280"), fmt(b["sphb20"]), fmt(b["sphb60"]), "-"]],
+                head=["", "SPHB 1 mo", "SPHB 3 mo", "Worst dip in 3 mo"])
+        worst = sorted(past, key=lambda s: s["sphb_low60"])[:3]
+        m.para("Biggest drops that followed: " + "; ".join(f"{s['d']} ({s['sphb_low60']:+.0f}%)" for s in worst)
+               + f". SPHB was higher 3 months later after {round(100 * sum(s['sphb60'] > 0 for s in past) / len(past))}% "
+               "of breaks: the value is in sidestepping the few large declines, at the cost of some whipsaws.")
+    macro_block(m, c)
+    m.para("Rule: SPHB closes more than 2% below its 20-day EMA for the first time while its 15-day high is within 2% "
+           "of its 52-week high. One alert per peak; it re-arms at a new 52-week high. Not a recommendation to trade.", muted=True)
+    return m
+
+
 def alerts(c, state):
     """Returns the new state; sends what is due."""
     zone = zone_of(c["score"], state.get("zone"))
@@ -120,13 +151,25 @@ def alerts(c, state):
              card(c, "Market cycle", "Rolling over after overheating",
                   "The score is falling from an overheated reading in the last 20 sessions. Tops are processes: "
                   "watch beta leadership (SPHB/SPLV) and Nasdaq breadth for confirmation.", "Topping after overheated", HOT))
-    return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"]}
+    brk = next((s for s in reversed(c.get("signals", [])) if s["kind"] == "trend_break"), None)
+    sent_break = state.get("break")
+    if brk and brk["d"] == c["as_of"] and sent_break != brk["d"]:
+        send(f"High-beta trend break: SPHB {brk['off_peak']:+.1f}% from its high", break_card(c, brk))
+        sent_break = brk["d"]
+    return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"], "break": sent_break}
 
 
 def lambda_handler(event, context):
     event = event if isinstance(event, dict) else {}
     s3 = boto3.client("s3")
     prev = previous(s3)
+    if event.get("sample_break"):
+        brk = next((s for s in reversed((prev or {}).get("signals", [])) if s["kind"] == "trend_break"), None)
+        if not brk:
+            return {"statusCode": 404, "error": "no trend break in cycle.json"}
+        send(f"[Sample] High-beta trend break: SPHB {brk['off_peak']:+.1f}% from its high ({brk['d']})",
+             break_card(prev, brk, kicker="High beta - sample"))
+        return {"statusCode": 200, "sent": "sample_break"}
     if event.get("sample_alert"):
         if not prev:
             return {"statusCode": 404, "error": "no cycle.json yet"}

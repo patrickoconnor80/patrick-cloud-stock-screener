@@ -197,15 +197,54 @@ def replay_alerts(score: pd.Series, phase: pd.Series, spy: pd.Series, sphb: pd.S
             kinds.append("roll_over")
         for k in kinds:
             row = {"d": d.strftime("%Y-%m-%d"), "kind": k, "score": rnd(v), "spy": rnd(spy.get(d), 2), "sphb": rnd(sphb.get(d), 2)}
-            for n, px in (("spy", spy), ("sphb", sphb)):
-                p0, after = px.get(d), px[px.index > d]
-                for h in (20, 60):
-                    row[f"{n}{h}"] = rnd((after.iloc[h - 1] / p0 - 1) * 100, 1) if len(after) >= h and p0 else None
-                nxt = after.iloc[:60]
-                row[f"{n}_low60"] = rnd((nxt.min() / p0 - 1) * 100, 1) if len(nxt) and p0 else None
-                row[f"{n}_high60"] = rnd((nxt.max() / p0 - 1) * 100, 1) if len(nxt) and p0 else None
-            out.append(row)
+            out.append(_outcomes(row, d, spy, sphb))
         zone, last_phase = new, ph
+    return out
+
+
+def _outcomes(row: dict, d, spy: pd.Series, sphb: pd.Series) -> dict:
+    """SPY / SPHB return after 20 and 60 sessions, and the lowest / highest
+    close over the next 60, vs the signal-day close."""
+    for n, px in (("spy", spy), ("sphb", sphb)):
+        p0, after = px.get(d), px[px.index > d]
+        for h in (20, 60):
+            row[f"{n}{h}"] = rnd((after.iloc[h - 1] / p0 - 1) * 100, 1) if len(after) >= h and p0 else None
+        nxt = after.iloc[:60]
+        row[f"{n}_low60"] = rnd((nxt.min() / p0 - 1) * 100, 1) if len(nxt) and p0 else None
+        row[f"{n}_high60"] = rnd((nxt.max() / p0 - 1) * 100, 1) if len(nxt) and p0 else None
+    return row
+
+
+BREAK_PCT, NEAR_HIGH = 2.0, 2.0
+
+
+def trend_breaks(sphb: pd.Series, spy: pd.Series, score: pd.Series) -> list:
+    """High-beta trailing-stop signal: SPHB closes more than 2% below its
+    20-day EMA for the first time, while its 15-day high is within 2% of its
+    52-week high (the trend that is breaking was a leading one). Not a top
+    call: it fires after the peak, typically 5-10% off the high."""
+    sphb = sphb.dropna()
+    e20 = sphb.ewm(span=20).mean()
+    hi15, hi52 = sphb.rolling(15).max(), sphb.rolling(252).max()
+    below = sphb < e20 * (1 - BREAK_PCT / 100)
+    hit = below & ~below.shift(fill_value=False) & (hi15 >= hi52 * (1 - NEAR_HIGH / 100))
+    new_high = sphb >= hi52
+    days, armed = [], True       # one alert per peak: re-arms only at a new 52-week high
+    for d in sphb.index:
+        if new_high[d]:
+            armed = True
+        elif armed and hit[d]:
+            days.append(d)
+            armed = False
+    out = []
+    for d in days:
+        peak_d = sphb.loc[:d].iloc[-15:].idxmax()
+        row = {"d": d.strftime("%Y-%m-%d"), "kind": "trend_break", "score": rnd(score.get(d)),
+               "spy": rnd(spy.get(d), 2), "sphb": rnd(sphb[d], 2), "ema20": rnd(e20[d], 2),
+               "peak": rnd(sphb[peak_d], 2), "peak_d": peak_d.strftime("%Y-%m-%d"),
+               "off_peak": rnd((sphb[d] / sphb[peak_d] - 1) * 100, 1),
+               "below_ema": rnd((sphb[d] / e20[d] - 1) * 100, 1)}
+        out.append(_outcomes(row, d, spy, sphb))
     return out
 
 
@@ -373,6 +412,8 @@ def build(sp1500: list[str]) -> dict:
     # ---- backtest: SPY and SPHB forward returns by bucket and by phase
     sphb = cl["SPHB"].reindex(idx)
     signals = replay_alerts(score, phase, spy.Close, sphb)
+    start = signals[0]["d"] if signals else "2016-01-01"
+    signals = sorted(signals + [r for r in trend_breaks(sphb, spy.Close, score) if r["d"] >= start], key=lambda r: r["d"])
     fwd = {(n, h): s.shift(-h) / s - 1 for n, s in (("spy", spy.Close), ("sphb", sphb)) for h in HORIZONS}
 
     def stats(mask, name, **extra):
