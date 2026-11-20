@@ -20,6 +20,7 @@ resource "aws_lambda_function" "gex" {
       RESULTS_BUCKET             = var.website_bucket
       GEX_KEY                    = var.gex_key
       CLOUDFRONT_DISTRIBUTION_ID = var.cloudfront_distribution_id
+      ALERT_TOPIC_ARN            = aws_sns_topic.gex_alerts.arn
     }
   }
 
@@ -49,4 +50,29 @@ resource "aws_lambda_permission" "gex_allow_eventbridge" {
   function_name = aws_lambda_function.gex.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.gex.arn
+}
+
+# Email alerts for pin setups and upcoming events. Subscriptions are managed
+# outside Terraform (email endpoints need a confirmation click anyway):
+#   aws sns subscribe --topic-arn <arn> --protocol email --notification-endpoint <address>
+resource "aws_sns_topic" "gex_alerts" {
+  name = "${local.prefix}-gex-alerts"
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy" "gex_publish_alerts" {
+  name = "${local.prefix}-gex-publish-alerts"
+  role = aws_iam_role.stock_screener_lambda.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sns:Publish"
+      Resource = aws_sns_topic.gex_alerts.arn
+    }]
+  })
+}
+
+output "gex_alert_topic_arn" {
+  value = aws_sns_topic.gex_alerts.arn
 }
