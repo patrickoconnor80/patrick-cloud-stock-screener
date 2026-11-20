@@ -156,10 +156,11 @@ class Email:
                       f'border-radius:4px;font:14px/1.5 {FONT};color:#78350f;">{esc(s)}</div>')
         self.t += [f"!! {s}", ""]
 
-    def heading(self, s):
+    def heading(self, s, text=True):
         self.h.append(f'<div style="margin:22px 0 10px;padding-top:16px;border-top:1px solid #e5e7eb;'
                       f'font:700 11px {FONT};letter-spacing:.08em;text-transform:uppercase;color:#6b7280;">{esc(s)}</div>')
-        self.t += [s.upper(), "-" * len(s)]
+        if text:
+            self.t += [s.upper(), "-" * len(s)]
 
     def stats(self, pairs):
         """Row of label-over-value tiles."""
@@ -255,7 +256,7 @@ def heatmaps(m, tickers):
     for t in tickers:
         frag = heatmap_html(t)
         if frag:
-            m.heading(f"{t['ticker']} gamma heatmap")
+            m.heading(f"{t['ticker']} gamma heatmap", text=False)
             m.raw(frag)
 
 
