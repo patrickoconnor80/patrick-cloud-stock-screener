@@ -63,3 +63,9 @@ variable "cycle_schedule_expression" {
     # 22:30 UTC = 5:30pm EST / 6:30pm EDT, after Yahoo has the day's closes.
     default     = "cron(30 22 ? * MON-FRI *)"
 }
+
+variable "charts_prefix" {
+    description = "S3 prefix (within website_bucket) for the PNG charts the market cycle Lambda draws for alert emails"
+    type        = string
+    default     = "stock-screener/charts/"
+}

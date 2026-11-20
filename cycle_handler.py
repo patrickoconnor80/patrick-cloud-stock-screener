@@ -25,10 +25,12 @@ import boto3
 
 import cycle
 import screener
-from gex_handler import Email, send
+from gex_handler import Email, macro_block, send
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 CYCLE_KEY = os.environ.get("CYCLE_KEY", "stock-screener/cycle.json")
+CHARTS_PREFIX = os.environ.get("CHARTS_PREFIX", "stock-screener/charts/")
+SITE_ROOT = "https://patrick-cloud.com/"
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get("CLOUDFRONT_DISTRIBUTION_ID")
 SITE = "https://patrick-cloud.com/data.html"
 ZONE_IN, ZONE_RESET = 60, 40
@@ -71,12 +73,20 @@ def card(c, kicker, title, lead, setup, accent):
     m.table([[x["label"], x["value"] or "-",
               (f"{x['temp']:+d}" if x["temp"] is not None else "-", COLD if (x["temp"] or 0) < 0 else HOT)]
              for x in c["components"]], head=["", "Value", "-100 cold / +100 hot"])
-    mac = c["macro"]
-    m.heading(f"High beta: {c['beta']['status']} - Macro backdrop: {mac['overall']}")
-    sig = {"tailwind": "#16a34a", "headwind": "#dc2626", "neutral": "#6b7280"}
-    m.table([[i["label"], i["value"], i["change"], (i["signal"], sig[i["signal"]])] for i in mac["items"]])
+    m.para(f"High beta: {c['beta']['status']}.")
+    macro_block(m, c)
     m.para("Model readout from delayed Yahoo data; breadth uses today's index members. Not a recommendation to trade.", muted=True)
     return m
+
+
+def upload_charts(c, s3):
+    """Macro chart PNG for the emails. Dated key, so an old email keeps the
+    chart of its own day; nothing to invalidate."""
+    import charts   # matplotlib: only loaded on full runs
+    key = f"{CHARTS_PREFIX}macro-{c['as_of']}.png"
+    s3.put_object(Bucket=RESULTS_BUCKET, Key=key, Body=charts.macro_png(c["macro"]),
+                  ContentType="image/png", CacheControl="max-age=31536000")
+    return {"macro": SITE_ROOT + key}
 
 
 def alerts(c, state):
@@ -127,6 +137,10 @@ def lambda_handler(event, context):
                   setup, COLD if prev["score"] < 0 else HOT))
         return {"statusCode": 200, "sent": "sample"}
     c = cycle.build(screener.fetch_sp1500_universe())
+    try:
+        c["charts"] = upload_charts(c, s3)
+    except Exception as ex:   # emails fall back to the table alone
+        print(f"cycle charts failed: {type(ex).__name__}: {ex}")
 
     if prev is None:
         c["alert_state"] = {"zone": zone_of(c["score"], None), "phase": c["phase"], "as_of": c["as_of"]}

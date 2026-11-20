@@ -12,6 +12,7 @@ on:
       - "gex_handler.py"
       - "cycle.py"
       - "cycle_handler.py"
+      - "charts.py"
       - "events.json"
       - ".github/workflows/deploy-app.yml"
   workflow_dispatch:

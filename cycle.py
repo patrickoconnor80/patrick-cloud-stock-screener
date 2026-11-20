@@ -172,6 +172,43 @@ def component_detail(key, raw_s, temp_s, last):
     return out
 
 
+ZONE_IN, ZONE_RESET = 60, 40      # must match cycle_handler's alert rules
+
+
+def replay_alerts(score: pd.Series, phase: pd.Series, spy: pd.Series, sphb: pd.Series) -> list:
+    """Every alert the live rules (cycle_handler.alerts) would have sent, with
+    what SPY and high-beta SPHB did afterwards."""
+    out, zone, last_phase = [], None, None
+    s = score.dropna()
+    for i, d in enumerate(s.index):
+        v, ph = s.iloc[i], phase.get(d)
+        if i < 20 or ph is None:
+            zone = -1 if v <= -ZONE_IN else 1 if v >= ZONE_IN else None
+            last_phase = ph
+            continue
+        new = -1 if v <= -ZONE_IN else 1 if v >= ZONE_IN else (None if abs(v) < ZONE_RESET else zone)
+        win = s.iloc[i - 19:i + 1]
+        kinds = []
+        if new and new != zone:
+            kinds.append("washout" if new < 0 else "overheated")
+        if ph != last_phase and ph == "Bottoming" and win.min() <= -ZONE_IN:
+            kinds.append("turn_up")
+        if ph != last_phase and ph == "Topping" and win.max() >= ZONE_IN:
+            kinds.append("roll_over")
+        for k in kinds:
+            row = {"d": d.strftime("%Y-%m-%d"), "kind": k, "score": rnd(v), "spy": rnd(spy.get(d), 2), "sphb": rnd(sphb.get(d), 2)}
+            for n, px in (("spy", spy), ("sphb", sphb)):
+                p0, after = px.get(d), px[px.index > d]
+                for h in (20, 60):
+                    row[f"{n}{h}"] = rnd((after.iloc[h - 1] / p0 - 1) * 100, 1) if len(after) >= h and p0 else None
+                nxt = after.iloc[:60]
+                row[f"{n}_low60"] = rnd((nxt.min() / p0 - 1) * 100, 1) if len(nxt) and p0 else None
+                row[f"{n}_high60"] = rnd((nxt.max() / p0 - 1) * 100, 1) if len(nxt) and p0 else None
+            out.append(row)
+        zone, last_phase = new, ph
+    return out
+
+
 def phase_of(level, slope):
     if level < 0:
         return "Decline" if slope < 0 else "Bottoming"
@@ -180,50 +217,72 @@ def phase_of(level, slope):
 
 # ---------------------------------------------------------------- macro / beta
 def macro_panel(px: dict) -> dict:
-    """Each item: value, 3-month change, and whether it is a tailwind or a
-    headwind for high-beta stocks."""
-    def last(s):
-        return s.dropna().iloc[-1]
-
-    def chg(s, n=63):
-        s = s.dropna()
-        return s.iloc[-1] - s.iloc[-1 - n]
-
-    def pchg(s, n=63):
-        s = s.dropna()
-        return (s.iloc[-1] / s.iloc[-1 - n] - 1) * 100
-
-    def spark(s):
-        w = s.dropna().iloc[-260:].resample("W-FRI").last().dropna()
-        return [rnd(v, 3) for v in w]
-
+    """Each item: value, 3-month change, whether it is a tailwind or a headwind
+    for high-beta stocks, and its weekly history since 2019 with the signal it
+    gave at each point (so the chart can show past regimes)."""
     path = (px["2YY=F"] - px["^IRX"]).dropna() * 100           # bp
     tnx = px["^TNX"].dropna()
     infl = (px["TIP"] / px["IEF"]).dropna()
     credit = (px["HYG"] / px["IEF"]).dropna()
     dxy = px["DX-Y.NYB"].dropna()
 
-    def sig(x, good_below, bad_above):
-        return "tailwind" if x < good_below else "headwind" if x > bad_above else "neutral"
+    def chg(s, n=63):
+        return s - s.shift(n)
 
-    items = [
-        {"key": "path", "label": "Rate path priced", "value": f"{last(path):+.0f} bp",
-         "detail": "2-year yield minus 3-month T-bill. Below zero = cuts priced, above = hikes priced.",
-         "change": f"{chg(path):+.0f} bp in 3 mo", "signal": sig(last(path), -25, 25), "spark": spark(path)},
-        {"key": "tnx", "label": "10-year Treasury yield", "value": f"{last(tnx):.2f}%",
-         "detail": "Long-duration growth and beta names reprice hardest when long yields rise.",
-         "change": f"{chg(tnx) * 100:+.0f} bp in 3 mo", "signal": sig(chg(tnx), -0.25, 0.25), "spark": spark(tnx)},
-        {"key": "infl", "label": "Inflation expectations", "value": f"{pchg(infl):+.1f}%",
-         "detail": "TIPS vs nominal Treasuries (TIP/IEF), 3-month change. Rising = market pricing hotter inflation.",
-         "change": "TIP/IEF, 3 mo", "signal": sig(pchg(infl), -1, 1), "spark": spark(infl)},
-        {"key": "credit", "label": "Credit appetite", "value": f"{pchg(credit):+.1f}%",
-         "detail": "High-yield bonds vs Treasuries (HYG/IEF), 3-month change. Falling = spreads widening, risk-off.",
-         "change": "HYG/IEF, 3 mo", "signal": "headwind" if pchg(credit) < -1.5 else "tailwind" if pchg(credit) > 1.5 else "neutral",
-         "spark": spark(credit)},
-        {"key": "dxy", "label": "US dollar", "value": f"{last(dxy):.1f}",
-         "detail": "A rising dollar tightens global liquidity, which speculative names feel first.",
-         "change": f"{pchg(dxy):+.1f}% in 3 mo", "signal": sig(pchg(dxy), -2.5, 2.5), "spark": spark(dxy)},
+    def pchg(s, n=63):
+        return (s / s.shift(n) - 1) * 100
+
+    def regime(x, good_below, bad_above, invert=False):
+        """Series of signals: 'tailwind' / 'headwind' / 'neutral'."""
+        lo, hi = (x < good_below), (x > bad_above)
+        if invert:
+            lo, hi = hi, lo
+        return pd.Series(np.where(lo, "tailwind", np.where(hi, "headwind", "neutral")), index=x.index).where(x.notna())
+
+    specs = [
+        # key, label, series, driver (what the signal is computed from), signal series, value fmt, change fmt, unit
+        ("path", "Rate path priced", path, path, regime(path, -25, 25),
+         lambda: f"{path.iloc[-1]:+.0f} bp", lambda: f"{chg(path).iloc[-1]:+.0f} bp in 3 mo", "bp"),
+        ("tnx", "10-year Treasury yield", tnx, chg(tnx), regime(chg(tnx), -0.25, 0.25),
+         lambda: f"{tnx.iloc[-1]:.2f}%", lambda: f"{chg(tnx).iloc[-1] * 100:+.0f} bp in 3 mo", "%"),
+        ("infl", "Inflation expectations", infl, pchg(infl), regime(pchg(infl), -1, 1),
+         lambda: f"{pchg(infl).iloc[-1]:+.1f}%", lambda: "TIP/IEF, 3 mo", "TIP/IEF"),
+        ("credit", "Credit appetite", credit, pchg(credit), regime(pchg(credit), -1.5, 1.5, invert=True),
+         lambda: f"{pchg(credit).iloc[-1]:+.1f}%", lambda: "HYG/IEF, 3 mo", "HYG/IEF"),
+        ("dxy", "US dollar", dxy, pchg(dxy), regime(pchg(dxy), -2.5, 2.5),
+         lambda: f"{dxy.iloc[-1]:.1f}", lambda: f"{pchg(dxy).iloc[-1]:+.1f}% in 3 mo", "index"),
     ]
+    detail = {
+        "path": "2-year yield minus 3-month T-bill. Below zero = cuts priced, above = hikes priced.",
+        "tnx": "Long-duration growth and beta names reprice hardest when long yields rise.",
+        "infl": "TIPS vs nominal Treasuries (TIP/IEF), 3-month change. Rising = market pricing hotter inflation.",
+        "credit": "High-yield bonds vs Treasuries (HYG/IEF), 3-month change. Falling = spreads widening, risk-off.",
+        "dxy": "A rising dollar tightens global liquidity, which speculative names feel first.",
+    }
+    # what each chart draws: the level ("v") or the 3-month change that sets the signal ("x"), with its thresholds
+    PLOT = {
+        "path": {"key": "v", "label": "bp priced", "lines": [-25, 25]},
+        "tnx": {"key": "v", "label": "yield %", "lines": []},
+        "infl": {"key": "x", "label": "3-mo change %", "lines": [-1, 1]},
+        "credit": {"key": "x", "label": "3-mo change %", "lines": [-1.5, 1.5]},
+        "dxy": {"key": "v", "label": "index", "lines": []},
+    }
+    items = []
+    for key, label, ser, drv, sig, val, ch, unit in specs:
+        w = pd.DataFrame({"v": ser, "x": drv, "g": sig}).resample("W-FRI").last()
+        w = w[(w.index >= "2019-01-01") & w.v.notna()]
+        now = sig.dropna().iloc[-1]
+        share = sig.dropna()
+        share = share[share.index >= "2019-01-01"]
+        items.append({
+            "key": key, "label": label, "value": val(), "change": ch(), "detail": detail[key], "signal": now, "unit": unit,
+            "spark": [rnd(v, 3) for v in w.v.iloc[-52:]],
+            "hist": [{"d": d.strftime("%Y-%m-%d"), "v": rnd(r.v, 4), "x": rnd(r.x * (100 if key == "tnx" else 1), 2),
+                      "g": r.g if isinstance(r.g, str) else None} for d, r in w.iterrows()],
+            "plot": PLOT[key],
+            "share": {g: rnd((share == g).mean() * 100, 0) for g in ("tailwind", "neutral", "headwind")},
+            "since": share.index[0].strftime("%Y") if len(share) else None,
+        })
     tw = sum(i["signal"] == "tailwind" for i in items)
     hw = sum(i["signal"] == "headwind" for i in items)
     overall = "Tailwind" if tw - hw >= 2 else "Headwind" if hw - tw >= 2 else "Mixed"
@@ -313,6 +372,7 @@ def build(sp1500: list[str]) -> dict:
 
     # ---- backtest: SPY and SPHB forward returns by bucket and by phase
     sphb = cl["SPHB"].reindex(idx)
+    signals = replay_alerts(score, phase, spy.Close, sphb)
     fwd = {(n, h): s.shift(-h) / s - 1 for n, s in (("spy", spy.Close), ("sphb", sphb)) for h in HORIZONS}
 
     def stats(mask, name, **extra):
@@ -369,6 +429,7 @@ def build(sp1500: list[str]) -> dict:
         "bucket": next(n for lo, hi, n in BUCKETS if lo < score[last] <= hi),
         "phase": phase[last],
         "components": comps,
+        "signals": signals,
         "comp_dates": comp_dates,
         "history": [{"d": d.strftime("%Y-%m-%d"), "s": rnd(r.s), "m": rnd(r.m), "sl": rnd(r.sl), "spy": rnd(r.spy, 2)}
                     for d, r in hist.iterrows()],

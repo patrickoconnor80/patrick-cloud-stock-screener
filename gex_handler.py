@@ -358,6 +358,26 @@ def _lvl(t, k):
     return f"{v['strike']:g}" + (f" (~{v['strike'] * ix['ratio']:,.0f})" if ix.get("ratio") else "")
 
 
+MACRO_SIG = {"tailwind": "#16a34a", "headwind": "#dc2626", "neutral": "#6b7280"}
+
+
+def macro_block(m, c):
+    """Macro backdrop from cycle.json: the chart PNG the cycle Lambda draws
+    (email clients do not render SVG) and the readings table."""
+    mac = c.get("macro") or {}
+    if not mac.get("items"):
+        return
+    m.heading(f"Macro backdrop: {mac['overall']}")
+    url = (c.get("charts") or {}).get("macro")
+    if url:
+        m.raw(f'<img src="{esc(url)}" width="584" alt="Macro indicators, last two years, colored tailwind / neutral / '
+              f'headwind for high beta" style="display:block;width:100%;max-width:584px;height:auto;margin:0 0 10px;'
+              f'border:1px solid #e5e7eb;border-radius:6px;">')
+        m.t += [f"Chart: {url}", ""]
+    m.table([[i["label"], i["value"], i["change"], (i["signal"], MACRO_SIG.get(i["signal"], "#6b7280"))]
+             for i in mac["items"]])
+
+
 def daily_digest(payload, s3, now, force=False):
     """Morning gamma map: once a day in the 9:45-9:59 ET run (first prices after
     the open, open interest as of the prior close), or on demand."""
@@ -373,6 +393,7 @@ def daily_digest(payload, s3, now, force=False):
             "direction today." if short else "Dealers are net long gamma: hedging tends to dampen moves and pull price "
             "toward the big nodes.") if len(short) in (0, len(live)) else
            f"Mixed regime ({regimes} gamma): expect the short-gamma ticker to lead the moves.")
+    c = None
     try:   # market cycle context from the daily cycle Lambda
         c = json.loads(s3.get_object(Bucket=RESULTS_BUCKET, Key=CYCLE_KEY)["Body"].read())
         m.stats([("Market cycle", f"{c['score']:+.0f} {c['bucket']}"), ("Phase", c["phase"]),
@@ -394,6 +415,11 @@ def daily_digest(payload, s3, now, force=False):
             m.para(f"{o['horizon']}: {o['read']}")
             m.para(o["setup"], muted=True)
     heatmaps(m, live)
+    if c:
+        try:
+            macro_block(m, c)
+        except Exception as ex:
+            print(f"digest: macro block failed ({type(ex).__name__}: {ex})")
     send(f"Daily gamma map {now:%a %b} {now.day}: {regimes} gamma", m,
          footer=f"Model estimate from {payload.get('source') or 'delayed option chains'}. Not a recommendation to trade.")
 
