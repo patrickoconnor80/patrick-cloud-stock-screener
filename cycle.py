@@ -248,6 +248,36 @@ def trend_breaks(sphb: pd.Series, spy: pd.Series, score: pd.Series) -> list:
     return out
 
 
+def top_watch(vix: pd.Series, vix3m: pd.Series, spy: pd.Series, sphb: pd.Series, splv: pd.Series,
+              score: pd.Series) -> list:
+    """Top watch: fear waking up while the index is still near its high, and
+    high beta already lagging. VIX is 25%+ above its 20-day low (below 22),
+    or VIX/VIX3M is back above 0.90 after sitting under 0.82 in the last 20
+    sessions; SPY is within 3% of its 52-week high; SPHB/SPLV is under its
+    50-day average. First day of each episode (none in the prior 20 sessions).
+    Since 2016 about twice a year; SPHB averaged about 0% over the next 3
+    months (vs +4.7% for all days), with a -10% average worst dip."""
+    df = pd.DataFrame({"vix": vix, "v3": vix3m, "spy": spy, "sphb": sphb, "splv": splv}).dropna(subset=["spy", "sphb"]).ffill()
+    term = df.vix / df.v3
+    near_hi = df.spy >= df.spy.rolling(252).max() * 0.97
+    spike = (df.vix >= df.vix.rolling(20).min() * 1.25) & (df.vix < 22)
+    turn = (term > 0.90) & (term.rolling(20).min() < 0.82)
+    ratio = df.sphb / df.splv
+    lag = ratio < ratio.rolling(50).mean()
+    m = ((spike | turn) & near_hi & lag).fillna(False)
+    fresh = m & ~m.shift(1, fill_value=False).rolling(20, min_periods=1).max().astype(bool)
+    out = []
+    for d in df.index[fresh]:
+        row = {"d": d.strftime("%Y-%m-%d"), "kind": "top_watch", "score": rnd(score.get(d)),
+               "spy": rnd(df.spy[d], 2), "sphb": rnd(df.sphb[d], 2), "vix": rnd(df.vix[d], 1),
+               "vix_low20": rnd(df.vix.rolling(20).min()[d], 1), "term": rnd(term[d], 3),
+               "why": "VIX spike" if spike[d] else "term structure",
+               "spy_off_high": rnd((df.spy[d] / df.spy.rolling(252).max()[d] - 1) * 100, 1),
+               "ratio_vs_50d": rnd((ratio[d] / ratio.rolling(50).mean()[d] - 1) * 100, 1)}
+        out.append(_outcomes(row, d, df.spy, df.sphb))
+    return out
+
+
 def phase_of(level, slope):
     if level < 0:
         return "Decline" if slope < 0 else "Bottoming"
@@ -413,7 +443,8 @@ def build(sp1500: list[str]) -> dict:
     sphb = cl["SPHB"].reindex(idx)
     signals = replay_alerts(score, phase, spy.Close, sphb)
     start = signals[0]["d"] if signals else "2016-01-01"
-    signals = sorted(signals + [r for r in trend_breaks(sphb, spy.Close, score) if r["d"] >= start], key=lambda r: r["d"])
+    extra = trend_breaks(sphb, spy.Close, score) + top_watch(vix, vix3m, spy.Close, sphb, cl["SPLV"], score)
+    signals = sorted(signals + [r for r in extra if r["d"] >= start], key=lambda r: r["d"])
     fwd = {(n, h): s.shift(-h) / s - 1 for n, s in (("spy", spy.Close), ("sphb", sphb)) for h in HORIZONS}
 
     def stats(mask, name, **extra):

@@ -104,7 +104,7 @@ def break_card(c, r, kicker="High beta"):
     past = [s for s in c.get("signals", []) if s["kind"] == "trend_break" and s.get("sphb60") is not None]
     if past:
         avg = lambda k: sum(s[k] for s in past) / len(past)
-        fmt = lambda v: f"{v:+.1f}%"
+        fmt = lambda v: f"{(0.0 if abs(v) < 0.05 else v):+.1f}%"
         b = c["backtest"]["baseline"]
         m.heading(f"After the past {len(past)} breaks since {past[0]['d'][:4]}")
         m.table([["Trend break", fmt(avg("sphb20")), fmt(avg("sphb60")), fmt(avg("sphb_low60"))],
@@ -117,6 +117,41 @@ def break_card(c, r, kicker="High beta"):
     macro_block(m, c)
     m.para("Rule: SPHB closes more than 2% below its 20-day EMA for the first time while its 15-day high is within 2% "
            "of its 52-week high. One alert per peak; it re-arms at a new 52-week high. Not a recommendation to trade.", muted=True)
+    return m
+
+
+WATCH = "#9333ea"
+
+
+def watch_card(c, r, kicker="Top watch"):
+    """Top-watch email: VIX waking up near the highs while high beta lags."""
+    why = (f"VIX is at {r['vix']:.1f}, up {(r['vix'] / r['vix_low20'] - 1) * 100:.0f}% from its 20-day low of {r['vix_low20']:.1f}"
+           if r["why"] == "VIX spike" else
+           f"VIX/VIX3M is back at {r['term']:.2f} after sitting under 0.82: near-term protection is getting bid")
+    m = Email(kicker, "Fear is waking up near the highs", WATCH)
+    m.lead(f"{why}, with SPY only {abs(r['spy_off_high']):.1f}% below its 52-week high and high beta already lagging "
+           f"(SPHB/SPLV {r['ratio_vs_50d']:+.1f}% vs its 50-day). This combination has come before several high-beta "
+           "declines. It is a lean-defensive cue, not a sell signal: it often fires weeks early, and high beta sometimes "
+           "rallies first.")
+    m.stats([("VIX", f"{r['vix']:.1f}"), ("SPY off high", f"{r['spy_off_high']:+.1f}%"),
+             ("SPHB/SPLV vs 50d", f"{r['ratio_vs_50d']:+.1f}%"), ("Cycle score", f"{c['score']:+.0f}")])
+    past = [s for s in c.get("signals", []) if s["kind"] == "top_watch" and s.get("sphb60") is not None]
+    if past:
+        avg = lambda k: sum(s[k] for s in past) / len(past)
+        fmt = lambda v: f"{(0.0 if abs(v) < 0.05 else v):+.1f}%"
+        b = c["backtest"]["baseline"]
+        m.heading(f"After the past {len(past)} top watches since {past[0]['d'][:4]}")
+        m.table([["Top watch", fmt(avg("sphb20")), fmt(avg("sphb60")), fmt(avg("sphb_low60"))],
+                 [("All days", "#6b7280"), fmt(b["sphb20"]), fmt(b["sphb60"]), "-"]],
+                head=["", "SPHB 1 mo", "SPHB 3 mo", "Worst dip in 3 mo"])
+        worst = sorted(past, key=lambda s: s["sphb_low60"])[:3]
+        m.para("Biggest drops that followed: " + "; ".join(f"{s['d']} ({s['sphb_low60']:+.0f}%)" for s in worst)
+               + f". SPHB was still higher 3 months later after {round(100 * sum(s['sphb60'] > 0 for s in past) / len(past))}% "
+               "of them: use it to tighten stops and trim size, then let the trend-break alert decide.")
+    macro_block(m, c)
+    m.para("Rule: VIX 25% or more above its 20-day low (and under 22), or VIX/VIX3M back above 0.90 after being "
+           "under 0.82 in the last 20 sessions; SPY within 3% of its 52-week high; SPHB/SPLV below its 50-day average. "
+           "First day of each episode. Not a recommendation to trade.", muted=True)
     return m
 
 
@@ -156,7 +191,12 @@ def alerts(c, state):
     if brk and brk["d"] == c["as_of"] and sent_break != brk["d"]:
         send(f"High-beta trend break: SPHB {brk['off_peak']:+.1f}% from its high", break_card(c, brk))
         sent_break = brk["d"]
-    return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"], "break": sent_break}
+    tw = next((s for s in reversed(c.get("signals", [])) if s["kind"] == "top_watch"), None)
+    sent_watch = state.get("top_watch")
+    if tw and tw["d"] == c["as_of"] and sent_watch != tw["d"]:
+        send(f"Top watch: VIX waking up near the highs ({tw['vix']:.1f})", watch_card(c, tw))
+        sent_watch = tw["d"]
+    return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"], "break": sent_break, "top_watch": sent_watch}
 
 
 def lambda_handler(event, context):
@@ -170,6 +210,12 @@ def lambda_handler(event, context):
         send(f"[Sample] High-beta trend break: SPHB {brk['off_peak']:+.1f}% from its high ({brk['d']})",
              break_card(prev, brk, kicker="High beta - sample"))
         return {"statusCode": 200, "sent": "sample_break"}
+    if event.get("sample_watch"):
+        tw = next((s for s in reversed((prev or {}).get("signals", [])) if s["kind"] == "top_watch"), None)
+        if not tw:
+            return {"statusCode": 404, "error": "no top watch in cycle.json"}
+        send(f"[Sample] Top watch: VIX waking up near the highs ({tw['d']})", watch_card(prev, tw, kicker="Top watch - sample"))
+        return {"statusCode": 200, "sent": "sample_watch"}
     if event.get("sample_alert"):
         if not prev:
             return {"statusCode": 404, "error": "no cycle.json yet"}
