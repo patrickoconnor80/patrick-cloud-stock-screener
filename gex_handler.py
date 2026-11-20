@@ -21,7 +21,11 @@ Environment variables (set by Terraform):
                               (with the strike x expiration heatmap) to the topic's
                               confirmed email subscribers, falling back to SNS text
 
-Invoke with {"force": true} to run outside market hours, and
+Also a DAILY gamma map email in the 9:45-9:59am ET run: regime, key levels,
+outlook and heatmaps for each ticker, plus the market-cycle readout.
+
+Invoke with {"force": true} to run outside market hours,
+{"force": true, "daily_digest": true} to send the daily map now, and
 {"test_alert": true} to send a test email.
 """
 
@@ -129,7 +133,7 @@ def email_recipients():
 
 
 FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif"
-ACCENT = {"pin": "#0d9488", "event": "#d97706", "test": "#6b7280"}
+ACCENT = {"pin": "#0d9488", "event": "#d97706", "test": "#6b7280", "daily": "#4f46e5"}
 esc = html.escape
 
 
@@ -343,6 +347,57 @@ def event_alerts(payload, now):
         send(f"Event {d:%a %b} {d.day}: {e['name']}", m, footer="Not a recommendation to trade.")
 
 
+CYCLE_KEY = os.environ.get("CYCLE_KEY", "stock-screener/cycle.json")
+
+
+def _lvl(t, k):
+    v = (t.get("levels") or {}).get(k) if k != "flip" else ({"strike": t["flip"]} if t.get("flip") else None)
+    if not v:
+        return "-"
+    ix = t.get("index") or {}
+    return f"{v['strike']:g}" + (f" (~{v['strike'] * ix['ratio']:,.0f})" if ix.get("ratio") else "")
+
+
+def daily_digest(payload, s3, now, force=False):
+    """Morning gamma map: once a day in the 9:45-9:59 ET run (first prices after
+    the open, open interest as of the prior close), or on demand."""
+    if not force and not time(9, 45) <= now.time() < time(10, 0):
+        return
+    live = [t for t in payload["tickers"] if not t.get("error")]
+    if not live:
+        return
+    regimes = " / ".join(f"{t['ticker']} {t.get('regime', '?')}" for t in live)
+    m = Email("Daily gamma map", f"{now:%A, %B} {now.day}", ACCENT["daily"])
+    short = [t["ticker"] for t in live if t.get("regime") == "short"]
+    m.lead(("Dealers are net short gamma in " + " and ".join(short) + ": hedging tends to extend moves in either "
+            "direction today." if short else "Dealers are net long gamma: hedging tends to dampen moves and pull price "
+            "toward the big nodes.") if len(short) in (0, len(live)) else
+           f"Mixed regime ({regimes} gamma): expect the short-gamma ticker to lead the moves.")
+    try:   # market cycle context from the daily cycle Lambda
+        c = json.loads(s3.get_object(Bucket=RESULTS_BUCKET, Key=CYCLE_KEY)["Body"].read())
+        m.stats([("Market cycle", f"{c['score']:+.0f} {c['bucket']}"), ("Phase", c["phase"]),
+                 ("High beta", c["beta"]["status"].replace("Beta ", "")), ("Macro", c["macro"]["overall"])])
+    except Exception as ex:
+        print(f"digest: no cycle.json ({type(ex).__name__})")
+    today = now.date()
+    soon = [e for e in payload.get("events", []) if date.fromisoformat(e["date"]) in (today, next_trading_day(today))]
+    if soon:
+        m.callout("Scheduled: " + "; ".join(f"{_day(e['date'])} {e.get('time', '')} ET {e['name']}".replace("  ", " ") for e in soon))
+    for t in live:
+        ix = t.get("index") or {}
+        m.heading(f"{t['ticker']} ${t['spot']:,.2f}" + (f" (~{ix['spot']:,.0f} {ix['name']})" if ix.get("spot") else "")
+                  + f" - {t.get('regime', '?')} gamma")
+        m.table([["Gamma flip", _lvl(t, "flip")], ["Resistance (call wall)", _lvl(t, "resistance")],
+                 ["Support (put wall)", _lvl(t, "support")], ["Acceleration above", _lvl(t, "accel_up")],
+                 ["Acceleration below", _lvl(t, "accel_down")]])
+        for o in (t.get("outlook") or [])[:2]:
+            m.para(f"{o['horizon']}: {o['read']}")
+            m.para(o["setup"], muted=True)
+    heatmaps(m, live)
+    send(f"Daily gamma map {now:%a %b} {now.day}: {regimes} gamma", m,
+         footer=f"Model estimate from {payload.get('source') or 'delayed option chains'}. Not a recommendation to trade.")
+
+
 def lambda_handler(event, context):
     event = event if isinstance(event, dict) else {}
     if event.get("test_alert"):
@@ -375,7 +430,8 @@ def lambda_handler(event, context):
             },
         )
 
-    for fn, args in ((pin_alerts, (payload, prev)), (event_alerts, (payload, now))):
+    for fn, args in ((pin_alerts, (payload, prev)), (event_alerts, (payload, now)),
+                     (daily_digest, (payload, s3, now, bool(event.get("daily_digest"))))):
         try:
             fn(*args)
         except Exception as ex:   # alerting must never block the snapshot
