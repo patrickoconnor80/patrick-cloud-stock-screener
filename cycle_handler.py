@@ -25,7 +25,7 @@ import boto3
 
 import cycle
 import screener
-from gex_handler import Email, macro_block, send
+from gex_handler import Email, dial_block, macro_block, send
 
 RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "patrick-cloud.com")
 CYCLE_KEY = os.environ.get("CYCLE_KEY", "stock-screener/cycle.json")
@@ -155,6 +155,34 @@ def watch_card(c, r, kicker="Top watch"):
     return m
 
 
+DIAL = "#0d9488"
+
+
+def dial_card(c, kicker="De-risk dial"):
+    """Email when any stock's dial moved at today's close."""
+    moved = [s for s in (c.get("dial") or {}).get("stocks", []) if s.get("moved_today")]
+    trims = [s for s in moved if s["last"]["to"] < s["last"]["from"]]
+    adds = [s for s in moved if s["last"]["to"] > s["last"]["from"]]
+    say = lambda g, verb: f"{verb} " + ", ".join(f"{s['t']} to {s['w']}%" for s in g)
+    title = "; ".join(x for x in (say(trims, "Trim") if trims else "", say(adds, "Add") if adds else "") if x)
+    m = Email(kicker, title or "Dial unchanged", DIAL)
+    m.lead("The de-risk dial moved at the close. Each move is one small step, so a wrong call costs little: trims "
+           "come after big runs or market warnings, adds come back on recovery. Trade at or near the next close.")
+    m.stats([("Cycle score", f"{c['score']:+.0f}"), ("Phase", c["phase"]), ("Beta", c["beta"]["status"].replace("Beta ", "")),
+             ("Close", c["as_of"])])
+    dial_block(m, c, only_today=True)
+    m.heading("All positions")
+    dl = c["dial"]
+    m.table([[s["t"], f"{s['w']}%", f"{s['off_high']:+.0f}%", f"{s['vs_ema20']:+.0f}%", f"{s['vs_sma50']:+.0f}%"] for s in dl["stocks"]],
+            head=["", "Dial", "Off 52w high", "vs 20d EMA", "vs 50d"])
+    b = dl.get("basket") or {}
+    if b.get("dial"):
+        m.para(f"Equal-weight replay this year: dial {b['dial']['ytd']:+.1f}% (worst drop {b['dial']['ytd_dd']:.0f}%) vs held "
+               f"{b['hold']['ytd']:+.1f}% ({b['hold']['ytd_dd']:.0f}%). Rules tuned on past data; not a recommendation to trade.", muted=True)
+    m.para(f"Page: {SITE}#dial", muted=True)
+    return m
+
+
 def alerts(c, state):
     """Returns the new state; sends what is due."""
     zone = zone_of(c["score"], state.get("zone"))
@@ -196,7 +224,13 @@ def alerts(c, state):
     if tw and tw["d"] == c["as_of"] and sent_watch != tw["d"]:
         send(f"Top watch: VIX waking up near the highs ({tw['vix']:.1f})", watch_card(c, tw))
         sent_watch = tw["d"]
-    return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"], "break": sent_break, "top_watch": sent_watch}
+    sent_dial = state.get("dial")
+    if any(s.get("moved_today") for s in (c.get("dial") or {}).get("stocks", [])) and sent_dial != c["as_of"]:
+        m = dial_card(c)
+        send(f"Dial: {m.title}", m)
+        sent_dial = c["as_of"]
+    return {"zone": zone, "phase": c["phase"], "as_of": c["as_of"], "break": sent_break, "top_watch": sent_watch,
+            "dial": sent_dial}
 
 
 def lambda_handler(event, context):
@@ -216,6 +250,15 @@ def lambda_handler(event, context):
             return {"statusCode": 404, "error": "no top watch in cycle.json"}
         send(f"[Sample] Top watch: VIX waking up near the highs ({tw['d']})", watch_card(prev, tw, kicker="Top watch - sample"))
         return {"statusCode": 200, "sent": "sample_watch"}
+    if event.get("sample_dial"):
+        if not (prev or {}).get("dial"):
+            return {"statusCode": 404, "error": "no dial in cycle.json"}
+        last = max(s["last"]["d"] for s in prev["dial"]["stocks"] if s.get("last"))
+        for s in prev["dial"]["stocks"]:   # show the most recent day the dial moved
+            s["moved_today"] = bool(s.get("last")) and s["last"]["d"] == last
+        m = dial_card(prev, kicker="De-risk dial - sample")
+        send(f"[Sample] Dial ({last}): {m.title}", m)
+        return {"statusCode": 200, "sent": "sample_dial"}
     if event.get("sample_alert"):
         if not prev:
             return {"statusCode": 404, "error": "no cycle.json yet"}

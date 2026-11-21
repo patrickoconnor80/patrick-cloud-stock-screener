@@ -378,6 +378,28 @@ def macro_block(m, c):
              for i in mac["items"]])
 
 
+def _dial_color(w):
+    return "#16a34a" if w >= 85 else "#ca8a04" if w >= 55 else "#dc2626"
+
+
+def dial_block(m, c, only_today=False):
+    """Per-stock de-risk dial from cycle.json: exposure now, the last move and why."""
+    dl = c.get("dial") or {}
+    rows = [s for s in dl.get("stocks", []) if s.get("moved_today") or not only_today]
+    if not rows:
+        return
+    b = dl.get("basket") or {}
+    m.heading("De-risk dial" + (f": basket {b['dial']['ytd']:+.0f}% this year vs {b['hold']['ytd']:+.0f}% held"
+                                if b.get("dial") and b.get("hold") else ""))
+    m.table([[s["t"], (f"{s['w']}%", _dial_color(s["w"])),
+              (f"{s['last']['from']}% to {s['last']['to']}% on {s['last']['d'][5:]}" if s.get("last") else "-"),
+              (s["last"]["why"] if s.get("last") else "-")] for s in rows],
+            head=["", "Dial", "Last move", "Why"])
+    m.para(f"Steps of {dl.get('step', 15)}% between a {dl.get('floor', 35)}% floor and full size. Trim: stretched 40%+ over the "
+           "50-day, a 5% crack under the 20-day EMA after a big run, or a market top watch / trend break. Add: market washout or "
+           "turning up, a new 52-week high, or back over a rising 20-day EMA while above the 50-day.", muted=True)
+
+
 def daily_digest(payload, s3, now, force=False):
     """Morning gamma map: once a day in the 9:45-9:59 ET run (first prices after
     the open, open interest as of the prior close), or on demand."""
@@ -414,6 +436,11 @@ def daily_digest(payload, s3, now, force=False):
         for o in (t.get("outlook") or [])[:2]:
             m.para(f"{o['horizon']}: {o['read']}")
             m.para(o["setup"], muted=True)
+    if c:
+        try:
+            dial_block(m, c)
+        except Exception as ex:
+            print(f"digest: dial block failed ({type(ex).__name__}: {ex})")
     heatmaps(m, live)
     if c:
         try:

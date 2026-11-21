@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 from datetime import datetime, timezone
 
 import numpy as np
@@ -385,6 +386,127 @@ def beta_panel(sphb: pd.Series, splv: pd.Series, spy: pd.Series) -> dict:
     }
 
 
+# ---------------------------------------------------------------- de-risk dial
+DIAL_TICKERS = [t.strip().upper() for t in os.environ.get("DIAL_TICKERS", "IONQ,BFLY,ONDS,TSLA,SPCX,PRME").split(",") if t.strip()]
+DIAL_STEP, DIAL_FLOOR = 0.15, 0.35
+DIAL_TRIM = {"top_watch", "trend_break"}
+DIAL_ADD = {"washout", "turn_up"}
+
+
+def dial_path(px: pd.Series, mkt: dict) -> tuple[pd.Series, list]:
+    """Per-stock exposure dial, decided at each close.
+
+    Trim one step (15%) when the stock is stretched (40%+ over its 50-day,
+    again only 20% higher than the last such trim), when it cracks after a
+    big run (5%+ under its 20-day EMA with the 60-day high 50%+ over the
+    120-day low; once per peak), or on a market top-watch / trend-break
+    alert. Add one step on a market washout / turning-up alert, a new
+    52-week high, or a close back over the 20-day EMA with price over the
+    50-day and the EMA rising (10 sessions apart). Floor 35%, cap 100%."""
+    ema20 = px.ewm(span=20).mean()
+    sma50 = px.rolling(50, min_periods=20).mean()
+    hi60 = px.rolling(60, min_periods=20).max()
+    lo120 = px.rolling(120, min_periods=20).min()
+    hi252 = px.rolling(252, min_periods=20).max()
+    w, out, log = 1.0, [], []
+    last_trim_px, armed, last_add = None, True, None
+    for i, (d, p) in enumerate(px.items()):
+        if i >= 20:
+            new, why = w, []
+            stretched = p >= sma50.iloc[i] * 1.4
+            if stretched and (last_trim_px is None or p >= last_trim_px * 1.2):
+                new -= DIAL_STEP; why.append("stretched 40%+ over its 50-day"); last_trim_px = p
+            if not stretched and p < sma50.iloc[i]:
+                last_trim_px = None
+            if p >= hi60.iloc[i]:
+                armed = True
+            if armed and hi60.iloc[i] >= lo120.iloc[i] * 1.5 and p < ema20.iloc[i] * 0.95:
+                new -= DIAL_STEP; why.append("cracked 5% under its 20-day EMA after a big run"); armed = False
+            k = mkt.get(d, set())
+            for kind in sorted(DIAL_TRIM & k):
+                new -= DIAL_STEP; why.append({"top_watch": "market top watch", "trend_break": "high-beta trend break"}[kind])
+            if new == w and w < 1:
+                tag = None
+                if p >= hi252.iloc[i]:
+                    tag = "new 52-week high"
+                elif (p >= ema20.iloc[i] and px.iloc[i - 1] < ema20.iloc[i - 1] and p > sma50.iloc[i]
+                      and ema20.iloc[i] > ema20.iloc[i - 5] and (last_add is None or i - last_add >= 10)):
+                    tag = "back over a rising 20-day EMA"
+                elif DIAL_ADD & k:
+                    tag = {"washout": "market washout", "turn_up": "market turning up"}[sorted(DIAL_ADD & k)[-1]]
+                if tag:
+                    new += DIAL_STEP; why.append(tag); last_add = i
+            new = min(1.0, max(DIAL_FLOOR, round(new, 4)))
+            if new != w:
+                log.append({"d": d.strftime("%Y-%m-%d"), "p": rnd(p, 2), "from": round(w * 100), "to": round(new * 100),
+                            "why": ", ".join(why)})
+            w = new
+        out.append(w)
+    return pd.Series(out, index=px.index), log
+
+
+def holdings_dial(signals: list, irx: pd.Series, tickers=None) -> dict:
+    tickers = tickers or DIAL_TICKERS
+    mkt = {}
+    for g in signals:
+        mkt.setdefault(pd.Timestamp(g["d"]), set()).add(g["kind"])
+    start = pd.Timestamp(signals[0]["d"]) if signals else pd.Timestamp("2016-06-01")
+    ytd0 = pd.Timestamp(f"{datetime.now(timezone.utc).year - 1}-12-31")
+    mdd = lambda e: float(((e / e.cummax()) - 1).min() * 100)
+    stocks, eqs = [], {}
+    for t in tickers:
+        try:
+            px = ohlc(t)["Close"].dropna()
+        except Exception as ex:
+            print(f"dial {t}: {type(ex).__name__}: {ex}")
+            continue
+        px = px[px.index >= max(start, px.index[0])]
+        if len(px) < 40:
+            continue
+        w, log = dial_path(px, mkt)
+        cash = (irx.reindex(px.index).ffill().fillna(0) / 100 / 252)
+        r = px.pct_change().fillna(0)
+        held = w.shift(1).fillna(1.0)                     # traded at the next close
+        eq_d, eq_h = (1 + held * r + (1 - held) * cash).cumprod(), (1 + r).cumprod()
+        eqs[t] = (eq_h, eq_d)
+        yr = lambda e: e[e.index > ytd0]
+        ytd = lambda e: (float(e.iloc[-1] / e[e.index <= ytd0].iloc[-1] - 1) * 100) if (e.index <= ytd0).any() else float(e.iloc[-1] / e.iloc[0] - 1) * 100
+        yrs = max((px.index[-1] - px.index[0]).days / 365.25, 0.1)
+        d0 = px.index[-1].strftime("%Y-%m-%d")
+        hist = px[px.index > ytd0]
+        stocks.append({
+            "t": t, "price": rnd(px.iloc[-1], 2), "w": round(w.iloc[-1] * 100), "as_of": d0,
+            "moved_today": bool(log and log[-1]["d"] == d0), "last": log[-1] if log else None,
+            "moves": [m for m in log if pd.Timestamp(m["d"]) > ytd0],
+            "off_high": rnd((px.iloc[-1] / px.rolling(252, min_periods=20).max().iloc[-1] - 1) * 100),
+            "vs_ema20": rnd((px.iloc[-1] / px.ewm(span=20).mean().iloc[-1] - 1) * 100),
+            "vs_sma50": rnd((px.iloc[-1] / px.rolling(50, min_periods=20).mean().iloc[-1] - 1) * 100),
+            "ytd": {"hold": rnd(ytd(eq_h)), "dial": rnd(ytd(eq_d)), "hold_dd": rnd(mdd(yr(eq_h)) if len(yr(eq_h)) else 0),
+                    "dial_dd": rnd(mdd(yr(eq_d)) if len(yr(eq_d)) else 0)},
+            "full": {"from": px.index[0].strftime("%Y-%m-%d"), "hold_cagr": rnd((eq_h.iloc[-1] ** (1 / yrs) - 1) * 100),
+                     "dial_cagr": rnd((eq_d.iloc[-1] ** (1 / yrs) - 1) * 100), "hold_dd": rnd(mdd(eq_h)), "dial_dd": rnd(mdd(eq_d)),
+                     "avg_w": round(float(w.mean()) * 100), "moves_per_yr": rnd(len(log) / yrs)},
+            "hist": [{"d": d.strftime("%Y-%m-%d"), "p": rnd(v, 2), "w": round(w[d] * 100)} for d, v in hist.items()],
+        })
+    basket = {}
+    if eqs:
+        for k, j in (("hold", 0), ("dial", 1)):
+            rets = pd.concat({t: e[j].pct_change() for t, e in eqs.items()}, axis=1)
+            e = (1 + rets.mean(axis=1, skipna=True).fillna(0)).cumprod()
+            basket[k] = {"ytd": rnd(float(e.iloc[-1] / e[e.index <= ytd0].iloc[-1] - 1) * 100),
+                         "ytd_dd": rnd(mdd(e[e.index > ytd0])), "dd_3y": rnd(mdd(e[e.index >= ytd0 - pd.Timedelta(days=3 * 365)]))}
+    return {"tickers": [s["t"] for s in stocks], "step": round(DIAL_STEP * 100), "floor": round(DIAL_FLOOR * 100),
+            "stocks": stocks, "basket": basket}
+
+
+def _safe_dial(signals, irx):
+    try:   # the dial must never block the cycle page
+        return holdings_dial(signals, irx)
+    except Exception as ex:
+        print(f"dial failed: {type(ex).__name__}: {ex}")
+        return None
+
+
 # ---------------------------------------------------------------- build
 def build(sp1500: list[str]) -> dict:
     singles = ["^VIX", "^VIX3M", "SPY", "QQQ", "SPHB", "SPLV", "^IXIC",
@@ -509,6 +631,7 @@ def build(sp1500: list[str]) -> dict:
                        "weekly": [{"d": d.strftime("%Y-%m-%d"), "b": rnd(r.b), "ix": rnd(r.ix, 0)} for d, r in wk.iterrows()]},
         "beta": beta_panel(cl["SPHB"], cl["SPLV"], spy.Close),
         "macro": macro_panel(cl),
+        "dial": _safe_dial(signals, cl["^IRX"]),
         "backtest": {"buckets": buckets, "phases": phases, "setups": setups, "baseline": base,
                      "from": score.first_valid_index().strftime("%Y-%m-%d"), "to": last.strftime("%Y-%m-%d")},
         "universe": {"broad": int(broad.shape[1]), "ndx": int(ndx.shape[1]), "nasdaq": int(nas.shape[1])},
