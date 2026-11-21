@@ -487,6 +487,10 @@ def holdings_dial(signals: list, irx: pd.Series, tickers=None) -> dict:
                      "dial_cagr": rnd((eq_d.iloc[-1] ** (1 / yrs) - 1) * 100), "hold_dd": rnd(mdd(eq_h)), "dial_dd": rnd(mdd(eq_d)),
                      "avg_w": round(float(w.mean()) * 100), "moves_per_yr": rnd(len(log) / yrs)},
             "hist": [{"d": d.strftime("%Y-%m-%d"), "p": rnd(v, 2), "w": round(w[d] * 100)} for d, v in hist.items()],
+            # full replay for the stock pages: compact parallel arrays, plus every move
+            "series": {"d": [d.strftime("%Y-%m-%d") for d in px.index], "p": [rnd(v, 3 if v < 10 else 2) for v in px],
+                       "w": [round(v * 100) for v in w]},
+            "log": log,
         })
     basket = {}
     if eqs:
